@@ -1,17 +1,16 @@
-# EnergyCAP Pre-Export QA App — v3 Fast
+# EnergyCAP Pre-Export QA App — v4 dtype fix
 
-This version fixes the v2 performance issue and the `raw_record_preview` crash.
+Fixes the pandas dtype error in v3 where text values like `Electricity` or `Natural Gas`
+could not be inserted into columns initialized as numeric/NaN.
 
 ## Main fixes
 
-- Removed slow row-by-row raw-record aggregation.
-- Avoids turning every row of Reports 13/21/26 into a correction-register item.
-- Adds configurable caps for review records.
-- Keeps detailed record-level exceptions for actionable setup and usage issues from Reports 03 and 19.
-- Keeps Reports 13, 21, and 26 as supporting review inputs.
-- The app waits until all 5 reports are uploaded and the user clicks **Run QA**.
+- Text columns are explicitly initialized as object/string-safe columns.
+- Commodity inference assignment is now dtype-safe.
+- Usage standardization handles missing columns more safely.
+- Keeps the v3 fast architecture.
 
-## Run locally
+Run:
 
 ```bash
 pip install -r requirements.txt

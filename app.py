@@ -17,7 +17,7 @@ from energycap_qa import (
 st.set_page_config(page_title="EnergyCAP Pre-Export QA", layout="wide")
 
 st.title("EnergyCAP Pre-Export QA Correction Workbench")
-st.caption("Fast v3: waits for all files, then produces actionable record-level exceptions without expanding every supporting report row.")
+st.caption("v4 dtype fix: waits for all files, then produces actionable record-level exceptions.")
 
 with st.sidebar:
     st.header("1) Upload required reports")
@@ -75,11 +75,6 @@ if run_qa:
         st.session_state["issue_detail"] = issue_detail
         st.session_state["issue_summary"] = issue_summary
         st.session_state["score"] = score
-        st.session_state["support_samples"] = {
-            "Report-13": r13_sample,
-            "Report-21": r21_sample,
-            "Report-26": r26_sample,
-        }
 
 master = st.session_state["master"]
 usage = st.session_state["usage"]
@@ -165,8 +160,8 @@ with tab4:
     st.dataframe(master, use_container_width=True, height=500)
     completeness = pd.DataFrame({
         "field": master.columns,
-        "missing_count": [master[c].isna().sum() for c in master.columns],
-        "missing_pct": [master[c].isna().mean() for c in master.columns],
+        "missing_count": [master[c].isna().sum() if not pd.api.types.is_object_dtype(master[c]) else master[c].fillna("").astype(str).str.strip().eq("").sum() for c in master.columns],
+        "missing_pct": [master[c].isna().mean() if not pd.api.types.is_object_dtype(master[c]) else master[c].fillna("").astype(str).str.strip().eq("").mean() for c in master.columns],
     }).sort_values("missing_pct", ascending=False)
     st.subheader("Master Data Completeness")
     st.dataframe(completeness, use_container_width=True)
@@ -185,4 +180,4 @@ with tab6:
     st.download_button("Download normalized Report-03 master", master.to_csv(index=False).encode("utf-8"), "normalized_report03_master.csv", "text/csv")
     st.download_button("Download normalized Report-19 usage", usage.to_csv(index=False).encode("utf-8"), "normalized_report19_usage.csv", "text/csv")
 
-st.caption("EnergyCAP QA App v3 Fast. Report 13/21/26 records are sampled for review to keep the app responsive.")
+st.caption("EnergyCAP QA App v4. Text columns are dtype-safe; Reports 13/21/26 are sampled for responsiveness.")

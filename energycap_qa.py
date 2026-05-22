@@ -14,12 +14,38 @@ GAS_UNITS = {
     "btu": 0.000001, "ccf": 0.1037, "mcf": 1.037,
 }
 
+TEXT_FIELDS = {
+    "source_report", "site_name", "site_code", "site_address", "country", "state",
+    "site_status", "account_name", "account_number", "account_status", "service_dates",
+    "vendor", "commodity", "meter_name", "meter_code", "meter_status", "meter_serial",
+    "primary_use", "weather_station", "legal_entity", "cost_center", "gl_record",
+    "unit", "invoice", "report_month", "correction_key"
+}
+
+DATE_FIELDS = {
+    "site_open_date", "site_close_date", "account_close_date",
+    "acct_meter_begin", "acct_meter_end", "month", "service_start", "service_end"
+}
+
+NUMERIC_FIELDS = {"floor_area", "usage", "cost", "usage_std", "impacted_mwh", "impacted_dth"}
+
+
 def clean_col(c: str) -> str:
     c = str(c).strip().replace("\n", " ")
     return re.sub(r"\s+", " ", c)
 
+
 def normalize_key(c: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", clean_col(c).lower())
+
+
+def empty_text_series(index):
+    return pd.Series("", index=index, dtype="object")
+
+
+def empty_float_series(index):
+    return pd.Series(np.nan, index=index, dtype="float64")
+
 
 def read_excel_flexible(uploaded_file) -> Dict[str, pd.DataFrame]:
     xls = pd.ExcelFile(uploaded_file)
@@ -35,10 +61,12 @@ def read_excel_flexible(uploaded_file) -> Dict[str, pd.DataFrame]:
             continue
     return out
 
+
 def choose_largest_sheet(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     if not sheets:
         return pd.DataFrame()
     return max(sheets.values(), key=lambda d: d.shape[0] * max(d.shape[1], 1)).copy()
+
 
 def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     if df is None or df.empty:
@@ -55,11 +83,12 @@ def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
                 return original
     return None
 
-def numeric_series(s) -> pd.Series:
+
+def numeric_series(s, index=None) -> pd.Series:
     if isinstance(s, pd.Series):
         raw = s
     else:
-        raw = pd.Series(s)
+        raw = pd.Series(s, index=index)
     return pd.to_numeric(
         raw.astype(str)
         .str.replace(",", "", regex=False)
@@ -69,8 +98,24 @@ def numeric_series(s) -> pd.Series:
         errors="coerce",
     )
 
-def date_series(s) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce")
+
+def date_series(s, index=None) -> pd.Series:
+    if isinstance(s, pd.Series):
+        return pd.to_datetime(s, errors="coerce")
+    return pd.Series(pd.NaT, index=index)
+
+
+def text_series(df, col):
+    if col and col in df.columns:
+        return df[col].fillna("").astype(str).replace("nan", "")
+    return empty_text_series(df.index)
+
+
+def raw_series(df, col):
+    if col and col in df.columns:
+        return df[col]
+    return empty_text_series(df.index)
+
 
 def infer_commodity(value) -> str:
     text = str(value).lower()
@@ -80,30 +125,36 @@ def infer_commodity(value) -> str:
         return "Natural Gas"
     return "Unknown"
 
+
 def standardize_usage_vectorized(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    if "unit" not in out.columns:
+        out["unit"] = empty_text_series(out.index)
+    if "commodity" not in out.columns:
+        out["commodity"] = empty_text_series(out.index)
+    if "usage" not in out.columns:
+        out["usage"] = empty_float_series(out.index)
+
     unit = out["unit"].fillna("").astype(str).str.strip().str.lower()
     commodity = out["commodity"].fillna("").astype(str).str.lower()
 
     out["usage_std"] = np.nan
-    out["std_unit"] = None
+    out["std_unit"] = pd.Series("", index=out.index, dtype="object")
 
     elec_factor = unit.map(ELECTRICITY_UNITS)
     gas_factor = unit.map(GAS_UNITS)
 
     elec_mask = commodity.str.contains("electric", na=False) | elec_factor.notna()
-    gas_mask = commodity.str.contains("gas", na=False) | gas_factor.notna()
+    gas_mask = (commodity.str.contains("gas", na=False) | gas_factor.notna()) & ~elec_mask
 
-    out.loc[elec_mask, "usage_std"] = out.loc[elec_mask, "usage"] * elec_factor.loc[elec_mask]
+    out.loc[elec_mask, "usage_std"] = out.loc[elec_mask, "usage"].astype(float) * elec_factor.loc[elec_mask].astype(float)
     out.loc[elec_mask, "std_unit"] = "MWh"
 
-    out.loc[gas_mask & ~elec_mask, "usage_std"] = out.loc[gas_mask & ~elec_mask, "usage"] * gas_factor.loc[gas_mask & ~elec_mask]
-    out.loc[gas_mask & ~elec_mask, "std_unit"] = "Dth"
+    out.loc[gas_mask, "usage_std"] = out.loc[gas_mask, "usage"].astype(float) * gas_factor.loc[gas_mask].astype(float)
+    out.loc[gas_mask, "std_unit"] = "Dth"
 
     return out
 
-def safe_col(df, col, default=np.nan):
-    return df[col] if col else default
 
 def build_master(report03: pd.DataFrame) -> pd.DataFrame:
     df = report03.copy()
@@ -138,29 +189,35 @@ def build_master(report03: pd.DataFrame) -> pd.DataFrame:
     }
 
     out = pd.DataFrame(index=df.index)
-    out["source_report"] = "Report-03"
+    out["source_report"] = pd.Series("Report-03", index=df.index, dtype="object")
     out["source_row"] = np.arange(2, len(df) + 2)
+
     for name, col in cols.items():
-        out[name] = safe_col(df, col)
+        if name in DATE_FIELDS:
+            out[name] = date_series(df[col], df.index) if col else pd.Series(pd.NaT, index=df.index)
+        elif name in NUMERIC_FIELDS:
+            out[name] = numeric_series(df[col], df.index) if col else empty_float_series(df.index)
+        else:
+            out[name] = text_series(df, col)
 
-    for d in ["site_open_date", "site_close_date", "account_close_date", "acct_meter_begin", "acct_meter_end"]:
-        out[d] = date_series(out[d])
-
-    missing_comm = out["commodity"].isna() | out["commodity"].astype(str).str.strip().eq("")
+    missing_comm = out["commodity"].fillna("").astype(str).str.strip().eq("")
     if missing_comm.any():
         combined = (
             out["account_name"].fillna("").astype(str) + " "
             + out["meter_name"].fillna("").astype(str) + " "
             + out["vendor"].fillna("").astype(str)
         )
-        out.loc[missing_comm, "commodity"] = combined.loc[missing_comm].map(infer_commodity)
+        inferred = combined.loc[missing_comm].map(infer_commodity).astype("object")
+        out["commodity"] = out["commodity"].astype("object")
+        out.loc[missing_comm, "commodity"] = inferred.values
 
     out["correction_key"] = (
         out["site_name"].fillna("").astype(str) + " | "
         + out["account_number"].fillna("").astype(str) + " | "
-        + out["meter_code"].fillna(out["meter_name"]).fillna("").astype(str)
+        + out["meter_code"].where(out["meter_code"].fillna("").astype(str).str.strip().ne(""), out["meter_name"]).fillna("").astype(str)
     )
     return out.reset_index(drop=True)
+
 
 def build_usage(report19: pd.DataFrame) -> pd.DataFrame:
     df = report19.copy()
@@ -181,17 +238,18 @@ def build_usage(report19: pd.DataFrame) -> pd.DataFrame:
     }
 
     out = pd.DataFrame(index=df.index)
-    out["source_report"] = "Report-19"
+    out["source_report"] = pd.Series("Report-19", index=df.index, dtype="object")
     out["source_row"] = np.arange(2, len(df) + 2)
+
     for name, col in cols.items():
-        out[name] = safe_col(df, col)
+        if name in DATE_FIELDS:
+            out[name] = date_series(df[col], df.index) if col else pd.Series(pd.NaT, index=df.index)
+        elif name in NUMERIC_FIELDS:
+            out[name] = numeric_series(df[col], df.index) if col else empty_float_series(df.index)
+        else:
+            out[name] = text_series(df, col)
 
-    out["usage"] = numeric_series(out["usage"])
-    out["cost"] = numeric_series(out["cost"])
-    for d in ["month", "service_start", "service_end"]:
-        out[d] = date_series(out[d])
-
-    missing_comm = out["commodity"].isna() | out["commodity"].astype(str).str.strip().eq("")
+    missing_comm = out["commodity"].fillna("").astype(str).str.strip().eq("")
     if missing_comm.any():
         combined = (
             out["site_name"].fillna("").astype(str) + " "
@@ -199,19 +257,21 @@ def build_usage(report19: pd.DataFrame) -> pd.DataFrame:
             + out["meter_name"].fillna("").astype(str) + " "
             + out["unit"].fillna("").astype(str)
         )
-        out.loc[missing_comm, "commodity"] = combined.loc[missing_comm].map(infer_commodity)
+        inferred = combined.loc[missing_comm].map(infer_commodity).astype("object")
+        out["commodity"] = out["commodity"].astype("object")
+        out.loc[missing_comm, "commodity"] = inferred.values
 
     out = standardize_usage_vectorized(out)
     out["report_month"] = out["month"].dt.to_period("M").astype(str).replace("NaT", "")
     out["correction_key"] = (
         out["site_name"].fillna("").astype(str) + " | "
         + out["account_number"].fillna("").astype(str) + " | "
-        + out["meter_code"].fillna(out["meter_name"]).fillna("").astype(str)
+        + out["meter_code"].where(out["meter_code"].fillna("").astype(str).str.strip().ne(""), out["meter_name"]).fillna("").astype(str)
     )
     return out.reset_index(drop=True)
 
+
 def summarize_supporting_report(df: pd.DataFrame, report_name: str, max_rows: int = 500) -> pd.DataFrame:
-    """Fast supporting report extraction. No row-wide string aggregation."""
     if df is None or df.empty:
         return pd.DataFrame()
     site = find_col(df, ["Building Name", "Site Name", "Place Name", "Site"])
@@ -225,23 +285,24 @@ def summarize_supporting_report(df: pd.DataFrame, report_name: str, max_rows: in
 
     keep = df.head(max_rows).copy()
     out = pd.DataFrame(index=keep.index)
-    out["source_report"] = report_name
+    out["source_report"] = pd.Series(report_name, index=keep.index, dtype="object")
     out["source_row"] = np.arange(2, len(keep) + 2)
-    out["site_name"] = safe_col(keep, site)
-    out["account_number"] = safe_col(keep, account)
-    out["meter_name"] = safe_col(keep, meter)
-    out["commodity"] = safe_col(keep, commodity)
-    out["usage"] = numeric_series(safe_col(keep, use, pd.Series([np.nan] * len(keep))))
-    out["unit"] = safe_col(keep, unit)
-    out["cost"] = numeric_series(safe_col(keep, cost, pd.Series([np.nan] * len(keep))))
-    out["month"] = date_series(safe_col(keep, month, pd.Series([pd.NaT] * len(keep))))
+    out["site_name"] = text_series(keep, site)
+    out["account_number"] = text_series(keep, account)
+    out["meter_name"] = text_series(keep, meter)
+    out["commodity"] = text_series(keep, commodity)
+    out["usage"] = numeric_series(keep[use], keep.index) if use else empty_float_series(keep.index)
+    out["unit"] = text_series(keep, unit)
+    out["cost"] = numeric_series(keep[cost], keep.index) if cost else empty_float_series(keep.index)
+    out["month"] = date_series(keep[month], keep.index) if month else pd.Series(pd.NaT, index=keep.index)
     out["report_row_count"] = len(df)
-    out["note"] = f"First {min(max_rows, len(df)):,} rows sampled from {len(df):,} total rows."
-    missing_comm = out["commodity"].isna() | out["commodity"].astype(str).str.strip().eq("")
+    out["note"] = pd.Series(f"First {min(max_rows, len(df)):,} rows sampled from {len(df):,} total rows.", index=keep.index, dtype="object")
+    missing_comm = out["commodity"].fillna("").astype(str).str.strip().eq("")
     if missing_comm.any():
-        out.loc[missing_comm, "commodity"] = out.loc[missing_comm, "unit"].map(infer_commodity)
+        out.loc[missing_comm, "commodity"] = out.loc[missing_comm, "unit"].map(infer_commodity).astype("object").values
     out = standardize_usage_vectorized(out)
     return out.reset_index(drop=True)
+
 
 def make_issue(row, rule, category, severity, description, correction_area, suggested_action,
                impacted_mwh=0.0, impacted_dth=0.0, likely_field=""):
@@ -273,6 +334,7 @@ def make_issue(row, rule, category, severity, description, correction_area, sugg
         "correction_key": row.get("correction_key", ""),
     }
 
+
 def impact_by_unit(row):
     std_unit = str(row.get("std_unit", ""))
     usage_std = row.get("usage_std", np.nan)
@@ -284,11 +346,13 @@ def impact_by_unit(row):
         return 0.0, float(abs(usage_std))
     return 0.0, 0.0
 
+
 def append_masked_issues(issues, df, mask, rule, cat, sev, desc, area, action, field, max_issues):
     subset = df[mask.fillna(False)].head(max_issues)
     for _, row in subset.iterrows():
         mwh, dth = impact_by_unit(row)
         issues.append(make_issue(row, rule, cat, sev, desc, area, action, mwh, dth, field))
+
 
 def create_record_level_issues(master: pd.DataFrame, usage: pd.DataFrame,
                                r13_sample: pd.DataFrame, r21_sample: pd.DataFrame, r26_sample: pd.DataFrame,
@@ -299,21 +363,21 @@ def create_record_level_issues(master: pd.DataFrame, usage: pd.DataFrame,
         checks = [
             ("MISSING_SITE_NAME", "Site attribution", "High", "Report-03 row does not have a site/building name.",
              "Sites and Meters", "Add or correct the site/building assignment for this account/meter row.", "Building Name / Site Name",
-             master["site_name"].isna() | master["site_name"].astype(str).str.strip().eq("")),
+             master["site_name"].fillna("").astype(str).str.strip().eq("")),
             ("MISSING_COUNTRY", "Emissions metadata", "High", "Site is missing country; emissions factors may not be assignable.",
              "Sites and Meters", "Populate country on the site/building record.", "Building Country / Country",
-             master["country"].isna() | master["country"].astype(str).str.strip().eq("")),
+             master["country"].fillna("").astype(str).str.strip().eq("")),
             ("MISSING_COMMODITY_MASTER", "Commodity setup", "High", "Account/meter row is missing or unknown commodity.",
              "Accounts or Meters", "Populate or correct the commodity on the account/meter setup.", "Commodity",
-             master["commodity"].isna() | master["commodity"].astype(str).str.strip().eq("") | master["commodity"].astype(str).str.lower().eq("unknown")),
+             master["commodity"].fillna("").astype(str).str.strip().eq("") | master["commodity"].astype(str).str.lower().eq("unknown")),
             ("ACCOUNT_WITHOUT_METER", "Meter structure", "Medium", "Account row does not show a meter name or meter code.",
              "Meters", "Confirm whether the account should be linked to a meter; add/correct meter relationship if needed.", "Meter Name / Meter Code",
-             (master["meter_name"].isna() | master["meter_name"].astype(str).str.strip().eq("")) &
-             (master["meter_code"].isna() | master["meter_code"].astype(str).str.strip().eq(""))),
+             master["meter_name"].fillna("").astype(str).str.strip().eq("") & master["meter_code"].fillna("").astype(str).str.strip().eq("")),
             ("MISSING_ACCOUNT_METER_BEGIN_DATE", "Account lifecycle", "Medium", "Account-meter relationship has no begin date.",
              "Account-Meter relationship", "Add the account-meter begin/effective date to support historical attribution.", "Account-Meter Begin Date",
              master["acct_meter_begin"].isna()),
         ]
+
         active_closed = (
             master["account_status"].astype(str).str.lower().str.contains("active", na=False)
             & master["site_status"].astype(str).str.lower().str.contains("closed|inactive", na=False)
@@ -342,7 +406,7 @@ def create_record_level_issues(master: pd.DataFrame, usage: pd.DataFrame,
         usage_checks = [
             ("USAGE_WITHOUT_SITE", "Site attribution", "High", "Usage row does not have a site name.",
              "Bill / Account / Site assignment", "Correct the account or meter site assignment so usage rolls to the correct site.", "Site Name",
-             usage["site_name"].isna() | usage["site_name"].astype(str).str.strip().eq("")),
+             usage["site_name"].fillna("").astype(str).str.strip().eq("")),
             ("MISSING_USAGE_VALUE", "Billing integrity", "High", "Usage row has no numeric usage value.",
              "Bill Entry", "Review the bill record and enter/correct the usage value.", "Use / Usage",
              usage["usage"].isna()),
@@ -351,7 +415,7 @@ def create_record_level_issues(master: pd.DataFrame, usage: pd.DataFrame,
              usage["usage"].notna() & usage["usage_std"].isna()),
             ("MISSING_COMMODITY_USAGE", "Commodity setup", "High", "Usage row has missing or unknown commodity.",
              "Bill Entry / Account Setup", "Correct the commodity associated with the bill/account/meter.", "Commodity",
-             usage["commodity"].isna() | usage["commodity"].astype(str).str.lower().eq("unknown")),
+             usage["commodity"].fillna("").astype(str).str.strip().eq("") | usage["commodity"].astype(str).str.lower().eq("unknown")),
         ]
         for args in usage_checks:
             append_masked_issues(issues, usage, args[-1], *args[:-1], max_detail_per_rule)
@@ -370,7 +434,7 @@ def create_record_level_issues(master: pd.DataFrame, usage: pd.DataFrame,
         if master is not None and not master.empty:
             master_sites = set(master["site_name"].dropna().astype(str).str.strip())
             unknown_site_mask = ~usage["site_name"].fillna("").astype(str).str.strip().isin(master_sites)
-            unknown_site_mask = unknown_site_mask & usage["site_name"].notna() & ~usage["site_name"].astype(str).str.strip().eq("")
+            unknown_site_mask = unknown_site_mask & usage["site_name"].fillna("").astype(str).str.strip().ne("")
             append_masked_issues(
                 issues, usage, unknown_site_mask, "USAGE_SITE_NOT_IN_REPORT03_MASTER", "Site attribution", "High",
                 "Usage site in Report-19 was not found in Report-03 master setup.",
@@ -398,7 +462,6 @@ def create_record_level_issues(master: pd.DataFrame, usage: pd.DataFrame,
                     0.0, 0.0, "Billing Period / Missing Bills"
                 ))
 
-    # Supporting review records: sample only, not full row explosion.
     for sample, rule, cat, sev, desc, area, action in [
         (r13_sample, "REPORT13_REVIEW_RECORD", "Billing integrity", "Medium",
          "Sampled row from Report-13 Bill Analysis for outlier/bill review.",
@@ -429,6 +492,7 @@ def create_record_level_issues(master: pd.DataFrame, usage: pd.DataFrame,
     ]
     return out[[c for c in preferred if c in out.columns]]
 
+
 def summarize_issues(issue_detail: pd.DataFrame) -> pd.DataFrame:
     if issue_detail is None or issue_detail.empty:
         return pd.DataFrame(columns=["category", "severity", "rule", "occurrences", "impacted_mwh", "impacted_dth"])
@@ -438,6 +502,7 @@ def summarize_issues(issue_detail: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
         .sort_values(["severity", "occurrences"], ascending=[True, False])
     )
+
 
 def score_qa(issue_detail: pd.DataFrame) -> int:
     if issue_detail is None or issue_detail.empty:
