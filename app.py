@@ -938,11 +938,11 @@ st.caption("Purpose: verify whether EnergyCAP energy-utility usage can be truste
 
 with st.sidebar:
     st.header("1) Upload EnergyCAP reports")
-    file03 = st.file_uploader("Report-03 — Setup / hierarchy master", type=["xlsx", "xls"], key="r03")
-    file19 = st.file_uploader("Report-19 — Monthly Utility Use and Cost", type=["xlsx", "xls"], key="r19")
-    file13 = st.file_uploader("Report-13 — Bill Analysis", type=["xlsx", "xls"], key="r13")
-    file21 = st.file_uploader("Report-21 — Monthly Comparison", type=["xlsx", "xls"], key="r21")
-    file26 = st.file_uploader("Report-26 — Use and Cost Summary", type=["xlsx", "xls"], key="r26")
+    file03 = st.file_uploader("Report-03 — Setup / hierarchy master", type=["xlsx", "xls"], key="upload_r03")
+    file19 = st.file_uploader("Report-19 — Monthly Utility Use and Cost", type=["xlsx", "xls"], key="upload_r19")
+    file13 = st.file_uploader("Report-13 — Bill Analysis", type=["xlsx", "xls"], key="upload_r13")
+    file21 = st.file_uploader("Report-21 — Monthly Comparison", type=["xlsx", "xls"], key="upload_r21")
+    file26 = st.file_uploader("Report-26 — Use and Cost Summary", type=["xlsx", "xls"], key="upload_r26")
 
     all_files = all([file03, file19, file13, file21, file26])
 
@@ -960,7 +960,7 @@ if not all_files:
     st.progress(uploaded_count / 5, text=f"{uploaded_count}/5 reports uploaded")
     st.stop()
 
-if not run_qa and "register" not in st.session_state:
+if not run_qa and "qa_register" not in st.session_state:
     st.success("All five reports are uploaded. Click **Run emissions export QA**.")
     st.stop()
 
@@ -1000,23 +1000,23 @@ if run_qa:
         score = readiness_score(register, usage)
         mapping = pd.concat([map03, map19, map13, map21, map26], ignore_index=True)
 
-        st.session_state["master"] = master
-        st.session_state["usage"] = usage
-        st.session_state["r26"] = r26
-        st.session_state["register"] = register
-        st.session_state["summary"] = summary
-        st.session_state["sites"] = sites
-        st.session_state["score"] = score
-        st.session_state["mapping"] = mapping
+        st.session_state["qa_master"] = master
+        st.session_state["qa_usage"] = usage
+        st.session_state["qa_r26"] = r26
+        st.session_state["qa_register"] = register
+        st.session_state["qa_summary"] = summary
+        st.session_state["qa_sites"] = sites
+        st.session_state["qa_score"] = score
+        st.session_state["qa_mapping"] = mapping
 
-master = st.session_state["master"]
-usage = st.session_state["usage"]
-r26 = st.session_state["r26"]
-register = st.session_state["register"]
-summary = st.session_state["summary"]
-sites = st.session_state["sites"]
-score = st.session_state["score"]
-mapping = st.session_state["mapping"]
+master = st.session_state["qa_master"]
+usage = st.session_state["qa_usage"]
+r26 = st.session_state["qa_r26"]
+register = st.session_state["qa_register"]
+summary = st.session_state["qa_summary"]
+sites = st.session_state["qa_sites"]
+score = st.session_state["qa_score"]
+mapping = st.session_state["qa_mapping"]
 
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("Export readiness score", f"{score}/100")

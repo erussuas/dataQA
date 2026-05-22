@@ -1,34 +1,20 @@
-# EnergyCAP Emissions Export QA Workbench — v7 Single File
+# EnergyCAP Emissions Export QA Workbench — v8 Key Fix
 
-This version removes the separate `energycap_qa.py` module to avoid import/deployment mismatch errors on Streamlit Cloud.
+Single-file Streamlit app.
 
-## Main file
+## Fix in v8
 
-Use:
+Fixes a Streamlit session-state key collision caused by using `r26` both as a file uploader widget key and as an internal dataframe key.
+
+## Deploy
+
+Upload only:
+
+- `app.py`
+- `requirements.txt`
+
+Then run:
 
 ```bash
 streamlit run app.py
 ```
-
-## Purpose
-
-The app creates an EnergyCAP object-level correction register before EnergyCAP energy utility usage is exported to a site-level emissions calculation tool.
-
-The correction register is organized by EnergyCAP object, not Excel row:
-
-- Site
-- Account
-- Meter
-- Account-Meter relationship
-- Site-Account-Meter-Commodity relationship
-- Site-Commodity monthly coverage
-- Bill / Usage record
-- Aggregate rollup / report filter issue
-
-## Required reports
-
-- Report-03
-- Report-19
-- Report-13
-- Report-21
-- Report-26
