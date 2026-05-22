@@ -430,6 +430,11 @@ def add_object_issue(
         "estimated_tco2e_exposure": estimated_tco2e_exposure,
         "recommended_energycap_fix": recommended_energycap_fix,
         "evidence": evidence,
+        "object_resolution_status": "Resolved" if (
+            norm_text_value(energycap_record) 
+            and norm_text_value(energycap_record).lower() not in {"→", "account  | meter  |  |", " → ", " |  |"}
+        ) else "Not resolved - check report configuration",
+        "object_resolution_note": "",
     })
 
 
@@ -753,14 +758,14 @@ def build_energycap_object_register(
             add_object_issue(
                 issues,
                 energycap_object_type="Aggregate rollup / report filter",
-                energycap_record=f"{r['site_name']} → {r['commodity']} → {unit}",
+                energycap_record=f"{r['site_name'] or r['site_key']} → {r['commodity'] or r['commodity_key']} → {unit}",
                 severity="High",
                 qa_domain="Rollup reconciliation",
                 issue="Report-26 aggregate usage does not reconcile to Report-19 usage at site/commodity/unit level.",
                 why_it_matters="The emissions export may not align with EnergyCAP rollups, indicating filter, chargeback, data type, or aggregation issues.",
                 source_reports="Report-26 vs Report-19",
-                site_name=r["site_name"],
-                commodity=r["commodity"],
+                site_name=r["site_name"] or r["site_key"],
+                commodity=r["commodity"] or r["commodity_key"],
                 impacted_mwh=float(mwh),
                 impacted_dth=float(dth),
                 estimated_tco2e_exposure=float(tco2e),
@@ -837,6 +842,65 @@ def build_energycap_object_register(
         .drop(columns=["_severity_order"])
         .reset_index(drop=True)
     )
+
+    # Add explicit notes where the relevant EnergyCAP object cannot be resolved from the uploaded reports.
+    def _resolution_note(row):
+        obj_type = str(row.get("energycap_object_type", ""))
+        site = norm_text_value(row.get("site_name", ""))
+        acct = norm_text_value(row.get("account_number", ""))
+        meter = norm_text_value(row.get("meter_name", "")) or norm_text_value(row.get("meter_code", ""))
+        source = str(row.get("source_reports", ""))
+        if obj_type in {"Site", "Site-Commodity relationship", "Site-Commodity monthly coverage", "Site-Commodity variance", "Aggregate rollup / report filter"}:
+            if not site:
+                return "Site not resolved. Re-run source reports with Group by = Sites and include site/building name where available."
+            return "Site-level issue; account/meter may not apply."
+        if obj_type in {"Account", "Account-Meter relationship", "Bill / Usage record", "Site-Account-Meter-Commodity relationship"}:
+            missing = []
+            if not site:
+                missing.append("site")
+            if not acct:
+                missing.append("account")
+            if obj_type in {"Account-Meter relationship", "Bill / Usage record", "Site-Account-Meter-Commodity relationship"} and not meter:
+                missing.append("meter")
+            if missing:
+                return "Could not resolve " + ", ".join(missing) + ". Re-run the source report with Group by/Row details that include Site, Account, Meter, and Commodity."
+            return "Resolved to site/account/meter."
+        return "Review source report configuration if object fields are blank."
+
+    out["object_resolution_note"] = out.apply(_resolution_note, axis=1)
+    out["object_resolution_status"] = np.where(
+        out["object_resolution_note"].str.startswith("Could not") | out["object_resolution_note"].str.startswith("Site not resolved"),
+        "Not resolved - check report configuration",
+        "Resolved or not applicable",
+    )
+
+    # Create an extra configuration issue when there are unresolved records, so it is obvious what to fix.
+    unresolved_count = int((out["object_resolution_status"] == "Not resolved - check report configuration").sum())
+    if unresolved_count > 0:
+        config_row = {
+            "register_id": "ECAP-QA-CONFIG",
+            "energycap_object_type": "Report configuration",
+            "energycap_record_to_review": "Uploaded EnergyCAP report configuration",
+            "severity": "High",
+            "qa_domain": "Report configuration",
+            "issue": f"{unresolved_count} QA records could not be resolved to a site/account/meter from the uploaded report columns.",
+            "why_it_matters_for_emissions_export": "The app cannot tell you which EnergyCAP object to fix unless the uploaded reports include enough hierarchy fields.",
+            "source_reports": "Report-03 / Report-19 / Report-26 / Report-13 / Report-21",
+            "site_name": "",
+            "account_number": "",
+            "meter_name": "",
+            "meter_code": "",
+            "commodity": "",
+            "months_impacted": "",
+            "impacted_mwh": 0.0,
+            "impacted_dth": 0.0,
+            "estimated_tco2e_exposure": 0.0,
+            "recommended_energycap_fix": "Re-run Report-19 grouped/exported with Site, Account, Meter, Commodity, Month, Usage and Unit. Re-run Report-26 with Group by = Site and Row details = Commodity. For account/meter-level QA, include Account and Meter identifiers where the report allows it.",
+            "evidence": f"unresolved_register_records={unresolved_count}",
+            "object_resolution_status": "Not resolved - check report configuration",
+            "object_resolution_note": "Uploaded reports did not provide enough hierarchy columns for all findings.",
+        }
+        out = pd.concat([pd.DataFrame([config_row]), out], ignore_index=True)
 
     return out
 
@@ -1082,6 +1146,7 @@ with tab1:
         st.markdown("### Top EnergyCAP records to review")
         top_cols = [
             "severity",
+            "object_resolution_status",
             "energycap_object_type",
             "energycap_record_to_review",
             "site_name",
@@ -1101,6 +1166,20 @@ with tab1:
 with tab2:
     st.subheader("EnergyCAP record correction register")
     st.write("This register is organized by the EnergyCAP object that needs attention — not by Excel row.")
+
+    with st.expander("How to read this register / why fields may be blank", expanded=True):
+        st.markdown("""
+        Start with **energycap_object_type** and **energycap_record_to_review**.
+
+        Some issues are inherently site-level or rollup-level, so **account** and **meter** may be not applicable.
+        If **object_resolution_status** says **Not resolved - check report configuration**, the uploaded report did not include enough hierarchy columns for the app to identify the specific EnergyCAP site/account/meter.
+
+        In that case, re-run the source report with more granular grouping:
+        - **Report-19:** include/group by Site, Account, Meter, Commodity, Month, Usage, Unit.
+        - **Report-26:** Group by = Site; Row details = Commodity. If available, run additional versions by Account and Meter.
+        - **Report-13:** include Account, Meter, Site fields if report/export allows it.
+        - **Report-21:** Group by = Sites for site-level review; run meter/account-level views if you need correction-level detail.
+        """)
 
     if register.empty:
         st.success("No EnergyCAP records to review.")
@@ -1141,6 +1220,7 @@ with tab2:
 
         priority_cols = [
             "severity",
+            "object_resolution_status",
             "energycap_object_type",
             "energycap_record_to_review",
             "site_name",
@@ -1150,6 +1230,7 @@ with tab2:
             "commodity",
             "months_impacted",
             "issue",
+            "object_resolution_note",
             "recommended_energycap_fix",
             "impacted_mwh",
             "impacted_dth",
@@ -1303,4 +1384,4 @@ with tab6:
         "text/csv",
     )
 
-st.caption("EnergyCAP Emissions Export QA Workbench v9 record-focused. The correction register points to EnergyCAP objects to review/fix.")
+st.caption("EnergyCAP Emissions Export QA Workbench v10 object-resolution. The correction register points to EnergyCAP objects to review/fix.")

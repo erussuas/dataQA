@@ -1,21 +1,13 @@
-# EnergyCAP Emissions Export QA Workbench — v9 Record-Focused UI
+# EnergyCAP Emissions Export QA Workbench — v10 Object Resolution
 
-This version makes the EnergyCAP record needing attention explicit in the UI.
+This version makes it explicit whether each QA finding was resolved to an EnergyCAP object.
 
-## Key UI changes
+## New fields
 
-- The correction register now prioritizes:
-  - `energycap_object_type`
-  - `energycap_record_to_review`
-  - `site_name`
-  - `account_number`
-  - `meter_name`
-  - `meter_code`
-  - `commodity`
-  - `issue`
-  - `recommended_energycap_fix`
-- Executive Readiness tab includes “Top EnergyCAP records to review.”
-- Site Readiness tab includes an “Issues grouped by site” view.
+- `object_resolution_status`
+- `object_resolution_note`
+
+If fields such as site/account/meter are blank, the app now tells you whether they are not applicable or whether the source report configuration did not include enough hierarchy detail.
 
 ## Deploy
 
