@@ -1079,6 +1079,23 @@ with tab1:
 
         st.dataframe(summary, use_container_width=True, height=350)
 
+        st.markdown("### Top EnergyCAP records to review")
+        top_cols = [
+            "severity",
+            "energycap_object_type",
+            "energycap_record_to_review",
+            "site_name",
+            "account_number",
+            "meter_name",
+            "meter_code",
+            "commodity",
+            "issue",
+            "recommended_energycap_fix",
+            "estimated_tco2e_exposure",
+        ]
+        top_cols = [c for c in top_cols if c in register.columns]
+        st.dataframe(register[top_cols].head(25), use_container_width=True, height=400)
+
     st.caption("Estimated tCO₂e exposure uses placeholder materiality factors only to prioritize QA. It is not an official emissions calculation.")
 
 with tab2:
@@ -1122,7 +1139,29 @@ with tab2:
             mask = filtered.astype(str).apply(lambda col: col.str.contains(search, case=False, na=False)).any(axis=1)
             filtered = filtered[mask]
 
-        st.dataframe(filtered, use_container_width=True, height=650)
+        priority_cols = [
+            "severity",
+            "energycap_object_type",
+            "energycap_record_to_review",
+            "site_name",
+            "account_number",
+            "meter_name",
+            "meter_code",
+            "commodity",
+            "months_impacted",
+            "issue",
+            "recommended_energycap_fix",
+            "impacted_mwh",
+            "impacted_dth",
+            "estimated_tco2e_exposure",
+            "evidence",
+            "source_reports",
+            "register_id",
+        ]
+        display_cols = [c for c in priority_cols if c in filtered.columns]
+        st.markdown("### EnergyCAP records to review/fix")
+        st.caption("Start with the columns `energycap_object_type` and `energycap_record_to_review`. These identify the EnergyCAP record to open or investigate.")
+        st.dataframe(filtered[display_cols], use_container_width=True, height=650)
 
         st.download_button(
             "Download filtered EnergyCAP correction register",
@@ -1134,7 +1173,35 @@ with tab2:
 with tab3:
     st.subheader("Site-level emissions readiness")
     st.write("This view shows whether each site appears ready for site-level emissions calculation.")
-    st.dataframe(sites, use_container_width=True, height=600)
+    site_cols = [
+        "readiness",
+        "site_name",
+        "commodities",
+        "months",
+        "open_qa_items",
+        "high_severity_items",
+        "total_mwh",
+        "total_dth",
+        "estimated_tco2e",
+        "impacted_tco2e",
+    ]
+    site_display_cols = [c for c in site_cols if c in sites.columns]
+    st.dataframe(sites[site_display_cols], use_container_width=True, height=600)
+
+    if not register.empty:
+        st.markdown("### Issues grouped by site")
+        site_issue_summary = (
+            register.groupby(["site_name", "energycap_object_type", "severity"], dropna=False)
+            .agg(
+                records=("register_id", "count"),
+                impacted_mwh=("impacted_mwh", "sum"),
+                impacted_dth=("impacted_dth", "sum"),
+                estimated_tco2e_exposure=("estimated_tco2e_exposure", "sum"),
+            )
+            .reset_index()
+            .sort_values(["severity", "records"], ascending=[True, False])
+        )
+        st.dataframe(site_issue_summary, use_container_width=True, height=450)
 
 with tab4:
     st.subheader("Hierarchy and rollup reconciliation")
@@ -1236,4 +1303,4 @@ with tab6:
         "text/csv",
     )
 
-st.caption("EnergyCAP Emissions Export QA Workbench v7 single-file. The correction register points to EnergyCAP objects to review/fix.")
+st.caption("EnergyCAP Emissions Export QA Workbench v9 record-focused. The correction register points to EnergyCAP objects to review/fix.")

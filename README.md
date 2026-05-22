@@ -1,10 +1,21 @@
-# EnergyCAP Emissions Export QA Workbench — v8 Key Fix
+# EnergyCAP Emissions Export QA Workbench — v9 Record-Focused UI
 
-Single-file Streamlit app.
+This version makes the EnergyCAP record needing attention explicit in the UI.
 
-## Fix in v8
+## Key UI changes
 
-Fixes a Streamlit session-state key collision caused by using `r26` both as a file uploader widget key and as an internal dataframe key.
+- The correction register now prioritizes:
+  - `energycap_object_type`
+  - `energycap_record_to_review`
+  - `site_name`
+  - `account_number`
+  - `meter_name`
+  - `meter_code`
+  - `commodity`
+  - `issue`
+  - `recommended_energycap_fix`
+- Executive Readiness tab includes “Top EnergyCAP records to review.”
+- Site Readiness tab includes an “Issues grouped by site” view.
 
 ## Deploy
 
@@ -12,9 +23,3 @@ Upload only:
 
 - `app.py`
 - `requirements.txt`
-
-Then run:
-
-```bash
-streamlit run app.py
-```
