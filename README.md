@@ -1,11 +1,7 @@
-# EnergyCAP Emissions Export QA Workbench — v13
+# EnergyCAP Emissions Export QA Workbench — v13.1 Name Fix
 
-Bulk upload Streamlit app for pre-export QA of EnergyCAP energy-utility usage data before site-level emissions calculation.
+Fixes the `NameError: load_excel_bytes is not defined` issue in v13.
 
-Upload multiple Excel reports at once, confirm report type and key columns, then generate:
-
-- Correction Register: records to fix in EnergyCAP
-- Risk Review Register: records to review before emissions export
-- Site Readiness table
-
-Deploy with `app.py` and `requirements.txt`.
+Deploy only:
+- `app.py`
+- `requirements.txt`

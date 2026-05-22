@@ -231,7 +231,7 @@ if not uploaded:
     st.info("Upload your EnergyCAP Excel reports to begin."); st.stop()
 loaded=[]
 for f in uploaded:
-    df,sheets=load_excel_bytes(f.name,f.getvalue()); det,conf=detect_report(f.name,df); loaded.append({"file":f.name,"df":df,"det":det,"conf":conf})
+    df,sheets=load_excel(f.name,f.getvalue()); det,conf=detect_report(f.name,df); loaded.append({"file":f.name,"df":df,"det":det,"conf":conf})
 st.subheader("Step 1 — Confirm report identification")
 assign={}; rows=[]
 for i,it in enumerate(loaded):
