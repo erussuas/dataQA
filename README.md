@@ -1,17 +1,11 @@
-# EnergyCAP Emissions Export QA Workbench — v11 Enriched Object Resolution
+# EnergyCAP Emissions Export QA Workbench — v13
 
-This version enriches the correction register after QA generation using Report-03 and Report-19 matches.
+Bulk upload Streamlit app for pre-export QA of EnergyCAP energy-utility usage data before site-level emissions calculation.
 
-## Improvements
+Upload multiple Excel reports at once, confirm report type and key columns, then generate:
 
-- Backfills site/account/meter/commodity fields from matching master and usage records.
-- Adds `record_grain`.
-- Uses “Multiple / not applicable” instead of blanks for site-level or aggregate issues.
-- Keeps `object_resolution_status` and `object_resolution_note`.
+- Correction Register: records to fix in EnergyCAP
+- Risk Review Register: records to review before emissions export
+- Site Readiness table
 
-## Deploy
-
-Upload only:
-
-- `app.py`
-- `requirements.txt`
+Deploy with `app.py` and `requirements.txt`.
