@@ -905,6 +905,163 @@ def build_energycap_object_register(
     return out
 
 
+
+def enrich_register_with_energycap_matches(register: pd.DataFrame, master: pd.DataFrame, usage: pd.DataFrame) -> pd.DataFrame:
+    if register is None or register.empty:
+        return register
+
+    out = register.copy()
+    for col in ["site_name", "account_number", "meter_name", "meter_code", "commodity", "energycap_record_to_review", "energycap_object_type"]:
+        if col not in out.columns:
+            out[col] = ""
+
+    combined = pd.concat([usage.assign(_source_priority=1), master.assign(_source_priority=2)], ignore_index=True, sort=False)
+    for col in ["site_name", "account_number", "meter_name", "meter_code", "commodity", "site_key", "account_key", "meter_key", "commodity_key"]:
+        if col not in combined.columns:
+            combined[col] = ""
+
+    def _first_nonblank(series):
+        for x in series:
+            x = norm_text_value(x)
+            if x:
+                return x
+        return ""
+
+    def _lookup_by(key_col, key_val):
+        key_val = norm_key_value(key_val)
+        if not key_val or key_col not in combined.columns:
+            return {}
+        matches = combined[combined[key_col].eq(key_val)].sort_values("_source_priority")
+        if matches.empty:
+            return {}
+        return {
+            "site_name": _first_nonblank(matches["site_name"]),
+            "account_number": _first_nonblank(matches["account_number"]),
+            "meter_name": _first_nonblank(matches["meter_name"]),
+            "meter_code": _first_nonblank(matches["meter_code"]),
+            "commodity": _first_nonblank(matches["commodity"]),
+        }
+
+    def _parse_record_text(record_text):
+        parts = [p.strip() for p in str(record_text).split("→")]
+        result = {}
+        if len(parts) >= 1:
+            result["site_name"] = parts[0]
+        if len(parts) >= 2:
+            result["account_number"] = parts[1]
+        if len(parts) >= 3:
+            result["meter_name"] = parts[2]
+        if len(parts) >= 4:
+            result["commodity"] = parts[3]
+        return result
+
+    enriched_rows = []
+    for _, original_row in out.iterrows():
+        row = original_row.copy()
+        obj_type = norm_text_value(row.get("energycap_object_type", ""))
+        record_text = norm_text_value(row.get("energycap_record_to_review", ""))
+
+        site = norm_text_value(row.get("site_name", ""))
+        acct = norm_text_value(row.get("account_number", ""))
+        meter_name = norm_text_value(row.get("meter_name", ""))
+        meter_code = norm_text_value(row.get("meter_code", ""))
+        comm = norm_text_value(row.get("commodity", ""))
+
+        parsed = _parse_record_text(record_text)
+        site = site or parsed.get("site_name", "")
+        acct = acct or parsed.get("account_number", "")
+        if not meter_name and not meter_code:
+            meter_name = parsed.get("meter_name", "")
+        comm = comm or parsed.get("commodity", "")
+
+        if acct:
+            match = _lookup_by("account_key", acct)
+            site = site or match.get("site_name", "")
+            meter_name = meter_name or match.get("meter_name", "")
+            meter_code = meter_code or match.get("meter_code", "")
+            comm = comm or match.get("commodity", "")
+
+        if meter_code or meter_name:
+            match = _lookup_by("meter_key", meter_code or meter_name)
+            site = site or match.get("site_name", "")
+            acct = acct or match.get("account_number", "")
+            comm = comm or match.get("commodity", "")
+
+        if site:
+            match = _lookup_by("site_key", site)
+            site = site or match.get("site_name", "")
+
+        if obj_type in {"Site", "Site-Commodity relationship", "Site-Commodity monthly coverage", "Site-Commodity variance"}:
+            row["record_grain"] = "Site / Site-Commodity"
+            acct = acct or "Multiple / not applicable at site-level"
+            meter_name = meter_name or "Multiple / not applicable at site-level"
+        elif obj_type == "Aggregate rollup / report filter":
+            row["record_grain"] = "Aggregate rollup"
+            acct = acct or "Multiple / not applicable to aggregate rollup"
+            meter_name = meter_name or "Multiple / not applicable to aggregate rollup"
+        elif obj_type == "Report configuration":
+            row["record_grain"] = "Report configuration"
+            site = site or "Not resolvable from current report configuration"
+            acct = acct or "Not resolvable from current report configuration"
+            meter_name = meter_name or "Not resolvable from current report configuration"
+        elif obj_type == "Account":
+            row["record_grain"] = "Account"
+            meter_name = meter_name or "Multiple / review account-level issue"
+        elif obj_type == "Account-Meter relationship":
+            row["record_grain"] = "Account-Meter"
+        elif obj_type == "Bill / Usage record":
+            row["record_grain"] = "Bill / Usage"
+        elif obj_type == "Site-Account-Meter-Commodity relationship":
+            row["record_grain"] = "Full hierarchy relationship"
+        else:
+            row["record_grain"] = obj_type or "Unknown"
+
+        row["site_name"] = site
+        row["account_number"] = acct
+        row["meter_name"] = meter_name
+        row["meter_code"] = meter_code
+        row["commodity"] = comm
+
+        missing = []
+        if not norm_text_value(site) or str(site).startswith("Not resolvable"):
+            missing.append("site")
+        if "not applicable" not in str(acct).lower() and "not resolvable" not in str(acct).lower() and not norm_text_value(acct):
+            missing.append("account")
+        if "not applicable" not in str(meter_name).lower() and "not resolvable" not in str(meter_name).lower() and not (norm_text_value(meter_name) or norm_text_value(meter_code)):
+            missing.append("meter")
+
+        if missing:
+            row["object_resolution_status"] = "Partially resolved"
+            row["object_resolution_note"] = "Could not resolve " + ", ".join(missing) + ". Re-run the relevant EnergyCAP report with Site, Account, Meter, Commodity detail."
+        else:
+            row["object_resolution_status"] = "Resolved or not applicable"
+            if not norm_text_value(row.get("object_resolution_note", "")):
+                row["object_resolution_note"] = "Resolved using Report-03/Report-19 reconciliation or marked not applicable for aggregate/site-level issue."
+
+        enriched_rows.append(row)
+
+    enriched = pd.DataFrame(enriched_rows)
+
+    def _direct_record(r):
+        obj_type = norm_text_value(r.get("energycap_object_type", ""))
+        site = norm_text_value(r.get("site_name", ""))
+        acct = norm_text_value(r.get("account_number", ""))
+        meter = norm_text_value(r.get("meter_code", "")) or norm_text_value(r.get("meter_name", ""))
+        comm = norm_text_value(r.get("commodity", ""))
+        if obj_type in {"Site", "Site-Commodity relationship", "Site-Commodity monthly coverage", "Site-Commodity variance"}:
+            return " → ".join([x for x in [site, comm] if x])
+        if obj_type == "Aggregate rollup / report filter":
+            return " → ".join([x for x in [site, comm, "Aggregate rollup"] if x])
+        if obj_type == "Account":
+            return " → ".join([x for x in [site, acct] if x])
+        if obj_type in {"Account-Meter relationship", "Bill / Usage record", "Site-Account-Meter-Commodity relationship"}:
+            return " → ".join([x for x in [site, acct, meter, comm] if x])
+        return norm_text_value(r.get("energycap_record_to_review", ""))
+
+    enriched["energycap_record_to_review"] = enriched.apply(_direct_record, axis=1)
+    return enriched
+
+
 def summarize_register(register: pd.DataFrame) -> pd.DataFrame:
     if register is None or register.empty:
         return pd.DataFrame(columns=[
@@ -1059,6 +1216,7 @@ if run_qa:
             max_objects_per_rule=max_objects_per_rule,
         )
 
+        register = enrich_register_with_energycap_matches(register, master, usage)
         summary = summarize_register(register)
         sites = site_readiness(master, usage, register)
         score = readiness_score(register, usage)
@@ -1148,6 +1306,7 @@ with tab1:
             "severity",
             "object_resolution_status",
             "energycap_object_type",
+            "record_grain",
             "energycap_record_to_review",
             "site_name",
             "account_number",
@@ -1222,6 +1381,7 @@ with tab2:
             "severity",
             "object_resolution_status",
             "energycap_object_type",
+            "record_grain",
             "energycap_record_to_review",
             "site_name",
             "account_number",
@@ -1384,4 +1544,4 @@ with tab6:
         "text/csv",
     )
 
-st.caption("EnergyCAP Emissions Export QA Workbench v10 object-resolution. The correction register points to EnergyCAP objects to review/fix.")
+st.caption("EnergyCAP Emissions Export QA Workbench v11 enriched-object-resolution. The correction register points to EnergyCAP objects to review/fix.")

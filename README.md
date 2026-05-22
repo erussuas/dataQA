@@ -1,13 +1,13 @@
-# EnergyCAP Emissions Export QA Workbench — v10 Object Resolution
+# EnergyCAP Emissions Export QA Workbench — v11 Enriched Object Resolution
 
-This version makes it explicit whether each QA finding was resolved to an EnergyCAP object.
+This version enriches the correction register after QA generation using Report-03 and Report-19 matches.
 
-## New fields
+## Improvements
 
-- `object_resolution_status`
-- `object_resolution_note`
-
-If fields such as site/account/meter are blank, the app now tells you whether they are not applicable or whether the source report configuration did not include enough hierarchy detail.
+- Backfills site/account/meter/commodity fields from matching master and usage records.
+- Adds `record_grain`.
+- Uses “Multiple / not applicable” instead of blanks for site-level or aggregate issues.
+- Keeps `object_resolution_status` and `object_resolution_note`.
 
 ## Deploy
 
