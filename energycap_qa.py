@@ -1,6 +1,6 @@
 
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
@@ -14,20 +14,9 @@ GAS_UNITS = {
     "btu": 0.000001, "ccf": 0.1037, "mcf": 1.037,
 }
 
-TEXT_FIELDS = {
-    "source_report", "site_name", "site_code", "site_address", "country", "state",
-    "site_status", "account_name", "account_number", "account_status", "service_dates",
-    "vendor", "commodity", "meter_name", "meter_code", "meter_status", "meter_serial",
-    "primary_use", "weather_station", "legal_entity", "cost_center", "gl_record",
-    "unit", "invoice", "report_month", "correction_key"
-}
-
-DATE_FIELDS = {
-    "site_open_date", "site_close_date", "account_close_date",
-    "acct_meter_begin", "acct_meter_end", "month", "service_start", "service_end"
-}
-
-NUMERIC_FIELDS = {"floor_area", "usage", "cost", "usage_std", "impacted_mwh", "impacted_dth"}
+# Fallback factors are only for materiality prioritization, not official emissions calculations.
+DEFAULT_ELECTRICITY_TCO2E_PER_MWH = 0.40
+DEFAULT_GAS_TCO2E_PER_DTH = 0.0053
 
 
 def clean_col(c: str) -> str:
@@ -39,12 +28,18 @@ def normalize_key(c: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", clean_col(c).lower())
 
 
-def empty_text_series(index):
-    return pd.Series("", index=index, dtype="object")
+def norm_text_value(x) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    s = re.sub(r"\s+", " ", s)
+    if s.lower() in {"nan", "none", "nat"}:
+        return ""
+    return s
 
 
-def empty_float_series(index):
-    return pd.Series(np.nan, index=index, dtype="float64")
+def norm_key_value(x) -> str:
+    return norm_text_value(x).lower()
 
 
 def read_excel_flexible(uploaded_file) -> Dict[str, pd.DataFrame]:
@@ -94,7 +89,8 @@ def numeric_series(s, index=None) -> pd.Series:
         .str.replace(",", "", regex=False)
         .str.replace("$", "", regex=False)
         .str.replace("(", "-", regex=False)
-        .str.replace(")", "", regex=False),
+        .str.replace(")", "", regex=False)
+        .str.replace("%", "", regex=False),
         errors="coerce",
     )
 
@@ -107,14 +103,8 @@ def date_series(s, index=None) -> pd.Series:
 
 def text_series(df, col):
     if col and col in df.columns:
-        return df[col].fillna("").astype(str).replace("nan", "")
-    return empty_text_series(df.index)
-
-
-def raw_series(df, col):
-    if col and col in df.columns:
-        return df[col]
-    return empty_text_series(df.index)
+        return df[col].map(norm_text_value).astype("object")
+    return pd.Series("", index=df.index, dtype="object")
 
 
 def infer_commodity(value) -> str:
@@ -123,17 +113,16 @@ def infer_commodity(value) -> str:
         return "Electricity"
     if any(x in text for x in ["natural gas", "gas", "therm", "dth", "mmbtu", "dekatherm"]):
         return "Natural Gas"
-    return "Unknown"
+    return ""
 
 
 def standardize_usage_vectorized(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    if "unit" not in out.columns:
-        out["unit"] = empty_text_series(out.index)
-    if "commodity" not in out.columns:
-        out["commodity"] = empty_text_series(out.index)
+    for c in ["unit", "commodity"]:
+        if c not in out.columns:
+            out[c] = ""
     if "usage" not in out.columns:
-        out["usage"] = empty_float_series(out.index)
+        out["usage"] = np.nan
 
     unit = out["unit"].fillna("").astype(str).str.strip().str.lower()
     commodity = out["commodity"].fillna("").astype(str).str.lower()
@@ -153,13 +142,33 @@ def standardize_usage_vectorized(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[gas_mask, "usage_std"] = out.loc[gas_mask, "usage"].astype(float) * gas_factor.loc[gas_mask].astype(float)
     out.loc[gas_mask, "std_unit"] = "Dth"
 
+    out["estimated_tco2e_exposure"] = 0.0
+    out.loc[out["std_unit"].eq("MWh"), "estimated_tco2e_exposure"] = out.loc[out["std_unit"].eq("MWh"), "usage_std"].abs() * DEFAULT_ELECTRICITY_TCO2E_PER_MWH
+    out.loc[out["std_unit"].eq("Dth"), "estimated_tco2e_exposure"] = out.loc[out["std_unit"].eq("Dth"), "usage_std"].abs() * DEFAULT_GAS_TCO2E_PER_DTH
+
     return out
 
 
-def build_master(report03: pd.DataFrame) -> pd.DataFrame:
-    df = report03.copy()
-    cols = {
-        "site_name": find_col(df, ["Building Name", "Site Name", "Place Name", "Site"]),
+def make_rel_keys(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in ["site_name", "account_number", "meter_code", "meter_name", "commodity"]:
+        if c not in out.columns:
+            out[c] = ""
+    meter_part = out["meter_code"].where(out["meter_code"].astype(str).str.strip().ne(""), out["meter_name"])
+    out["site_key"] = out["site_name"].map(norm_key_value)
+    out["account_key"] = out["account_number"].map(norm_key_value)
+    out["meter_key"] = meter_part.map(norm_key_value)
+    out["commodity_key"] = out["commodity"].map(norm_key_value)
+    out["site_account_key"] = out["site_key"] + " | " + out["account_key"]
+    out["account_meter_key"] = out["account_key"] + " | " + out["meter_key"]
+    out["full_rel_key"] = out["site_key"] + " | " + out["account_key"] + " | " + out["meter_key"] + " | " + out["commodity_key"]
+    out["site_commodity_key"] = out["site_key"] + " | " + out["commodity_key"]
+    return out
+
+
+def detect_columns_report03(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    return {
+        "site_name": find_col(df, ["Building Name", "Site Name", "Place Name", "Site", "Building"]),
         "site_code": find_col(df, ["Building Code", "Site Code", "Place Code"]),
         "site_address": find_col(df, ["Building Address", "Site Address", "Address"]),
         "country": find_col(df, ["Building Country", "Site Country", "Country"]),
@@ -171,58 +180,19 @@ def build_master(report03: pd.DataFrame) -> pd.DataFrame:
         "account_number": find_col(df, ["Account Number", "Acct Number"]),
         "account_status": find_col(df, ["Account Status"]),
         "account_close_date": find_col(df, ["Account Close Date"]),
-        "service_dates": find_col(df, ["Service Dates"]),
         "vendor": find_col(df, ["Vendor", "Vendor Name", "Utility"]),
         "commodity": find_col(df, ["Commodity"]),
         "meter_name": find_col(df, ["Meter Name"]),
         "meter_code": find_col(df, ["Meter Code"]),
         "meter_status": find_col(df, ["Meter Status"]),
-        "meter_serial": find_col(df, ["Serial Number", "Meter Serial Number"]),
         "acct_meter_begin": find_col(df, ["Account-Meter Begin Date", "Acct-Meter Begin Date", "Account Meter Begin Date"]),
         "acct_meter_end": find_col(df, ["Account-Meter End Date", "Acct-Meter End Date", "Account Meter End Date"]),
-        "primary_use": find_col(df, ["Primary Use"]),
-        "floor_area": find_col(df, ["Current Floor Area", "Floor Area"]),
-        "weather_station": find_col(df, ["Weather Station"]),
-        "legal_entity": find_col(df, ["Legal Entity"]),
-        "cost_center": find_col(df, ["Cost Center", "Cost Center Name"]),
-        "gl_record": find_col(df, ["General Ledger Record", "GL Record", "GL Code"]),
     }
 
-    out = pd.DataFrame(index=df.index)
-    out["source_report"] = pd.Series("Report-03", index=df.index, dtype="object")
-    out["source_row"] = np.arange(2, len(df) + 2)
 
-    for name, col in cols.items():
-        if name in DATE_FIELDS:
-            out[name] = date_series(df[col], df.index) if col else pd.Series(pd.NaT, index=df.index)
-        elif name in NUMERIC_FIELDS:
-            out[name] = numeric_series(df[col], df.index) if col else empty_float_series(df.index)
-        else:
-            out[name] = text_series(df, col)
-
-    missing_comm = out["commodity"].fillna("").astype(str).str.strip().eq("")
-    if missing_comm.any():
-        combined = (
-            out["account_name"].fillna("").astype(str) + " "
-            + out["meter_name"].fillna("").astype(str) + " "
-            + out["vendor"].fillna("").astype(str)
-        )
-        inferred = combined.loc[missing_comm].map(infer_commodity).astype("object")
-        out["commodity"] = out["commodity"].astype("object")
-        out.loc[missing_comm, "commodity"] = inferred.values
-
-    out["correction_key"] = (
-        out["site_name"].fillna("").astype(str) + " | "
-        + out["account_number"].fillna("").astype(str) + " | "
-        + out["meter_code"].where(out["meter_code"].fillna("").astype(str).str.strip().ne(""), out["meter_name"]).fillna("").astype(str)
-    )
-    return out.reset_index(drop=True)
-
-
-def build_usage(report19: pd.DataFrame) -> pd.DataFrame:
-    df = report19.copy()
-    cols = {
-        "site_name": find_col(df, ["Building Name", "Site Name", "Place Name", "Site"]),
+def detect_columns_usage(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    return {
+        "site_name": find_col(df, ["Building Name", "Site Name", "Place Name", "Site", "Building"]),
         "account_number": find_col(df, ["Account Number", "Acct Number", "Account"]),
         "meter_name": find_col(df, ["Meter Name", "Meter"]),
         "meter_code": find_col(df, ["Meter Code"]),
@@ -237,277 +207,583 @@ def build_usage(report19: pd.DataFrame) -> pd.DataFrame:
         "vendor": find_col(df, ["Vendor", "Utility", "Vendor Name"]),
     }
 
+
+def normalize_report03(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    cols = detect_columns_report03(df)
     out = pd.DataFrame(index=df.index)
-    out["source_report"] = pd.Series("Report-19", index=df.index, dtype="object")
+    out["source_report"] = "Report-03"
     out["source_row"] = np.arange(2, len(df) + 2)
 
-    for name, col in cols.items():
-        if name in DATE_FIELDS:
-            out[name] = date_series(df[col], df.index) if col else pd.Series(pd.NaT, index=df.index)
-        elif name in NUMERIC_FIELDS:
-            out[name] = numeric_series(df[col], df.index) if col else empty_float_series(df.index)
-        else:
-            out[name] = text_series(df, col)
+    text_cols = ["site_name", "site_code", "site_address", "country", "state", "site_status",
+                 "account_name", "account_number", "account_status", "vendor", "commodity",
+                 "meter_name", "meter_code", "meter_status"]
+    for c in text_cols:
+        out[c] = text_series(df, cols.get(c))
+    for c in ["site_open_date", "site_close_date", "account_close_date", "acct_meter_begin", "acct_meter_end"]:
+        out[c] = date_series(df[cols[c]], df.index) if cols.get(c) else pd.Series(pd.NaT, index=df.index)
 
-    missing_comm = out["commodity"].fillna("").astype(str).str.strip().eq("")
+    missing_comm = out["commodity"].str.strip().eq("")
     if missing_comm.any():
-        combined = (
-            out["site_name"].fillna("").astype(str) + " "
-            + out["account_number"].fillna("").astype(str) + " "
-            + out["meter_name"].fillna("").astype(str) + " "
-            + out["unit"].fillna("").astype(str)
-        )
-        inferred = combined.loc[missing_comm].map(infer_commodity).astype("object")
-        out["commodity"] = out["commodity"].astype("object")
-        out.loc[missing_comm, "commodity"] = inferred.values
+        combined = out["account_name"] + " " + out["meter_name"] + " " + out["vendor"]
+        out.loc[missing_comm, "commodity"] = combined.loc[missing_comm].map(infer_commodity).astype("object").values
+
+    out = make_rel_keys(out)
+
+    # Stable EnergyCAP object identifiers for the correction register.
+    out["site_record"] = np.where(out["site_code"].ne(""), out["site_name"] + " [" + out["site_code"] + "]", out["site_name"])
+    out["account_record"] = np.where(out["account_name"].ne(""), out["account_name"] + " / " + out["account_number"], out["account_number"])
+    meter_display = out["meter_code"].where(out["meter_code"].ne(""), out["meter_name"])
+    out["meter_record"] = meter_display
+    out["account_meter_record"] = out["account_record"] + " → " + out["meter_record"]
+    out["hierarchy_record"] = out["site_record"] + " → " + out["account_record"] + " → " + out["meter_record"] + " → " + out["commodity"]
+
+    mapping = pd.DataFrame({
+        "source_report": "Report-03",
+        "normalized_field": list(cols.keys()),
+        "detected_source_column": [cols[k] or "" for k in cols],
+        "mapping_use": ["reconciliation key / EnergyCAP object identity"] * len(cols),
+    })
+    return out.reset_index(drop=True), mapping
+
+
+def normalize_usage_report(df: pd.DataFrame, report_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    cols = detect_columns_usage(df)
+    out = pd.DataFrame(index=df.index)
+    out["source_report"] = report_name
+    out["source_row"] = np.arange(2, len(df) + 2)
+
+    for c in ["site_name", "account_number", "meter_name", "meter_code", "commodity", "unit", "invoice", "vendor"]:
+        out[c] = text_series(df, cols.get(c))
+    out["usage"] = numeric_series(df[cols["usage"]], df.index) if cols.get("usage") else pd.Series(np.nan, index=df.index)
+    out["cost"] = numeric_series(df[cols["cost"]], df.index) if cols.get("cost") else pd.Series(np.nan, index=df.index)
+    for c in ["month", "service_start", "service_end"]:
+        out[c] = date_series(df[cols[c]], df.index) if cols.get(c) else pd.Series(pd.NaT, index=df.index)
+
+    missing_comm = out["commodity"].str.strip().eq("")
+    if missing_comm.any():
+        combined = out["site_name"] + " " + out["account_number"] + " " + out["meter_name"] + " " + out["unit"]
+        out.loc[missing_comm, "commodity"] = combined.loc[missing_comm].map(infer_commodity).astype("object").values
 
     out = standardize_usage_vectorized(out)
     out["report_month"] = out["month"].dt.to_period("M").astype(str).replace("NaT", "")
-    out["correction_key"] = (
-        out["site_name"].fillna("").astype(str) + " | "
-        + out["account_number"].fillna("").astype(str) + " | "
-        + out["meter_code"].where(out["meter_code"].fillna("").astype(str).str.strip().ne(""), out["meter_name"]).fillna("").astype(str)
+    out = make_rel_keys(out)
+
+    out["site_record"] = out["site_name"]
+    out["account_record"] = out["account_number"]
+    meter_display = out["meter_code"].where(out["meter_code"].ne(""), out["meter_name"])
+    out["meter_record"] = meter_display
+    out["account_meter_record"] = out["account_record"] + " → " + out["meter_record"]
+    out["bill_usage_record"] = (
+        "Account " + out["account_number"] + " | Meter " + out["meter_record"] + " | "
+        + out["commodity"] + " | " + out["report_month"] + " | Invoice " + out["invoice"]
     )
-    return out.reset_index(drop=True)
+
+    mapping = pd.DataFrame({
+        "source_report": report_name,
+        "normalized_field": list(cols.keys()),
+        "detected_source_column": [cols[k] or "" for k in cols],
+        "mapping_use": ["usage fact / emissions export reconciliation"] * len(cols),
+    })
+    return out.reset_index(drop=True), mapping
 
 
-def summarize_supporting_report(df: pd.DataFrame, report_name: str, max_rows: int = 500) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    site = find_col(df, ["Building Name", "Site Name", "Place Name", "Site"])
-    account = find_col(df, ["Account Number", "Acct Number", "Account"])
-    meter = find_col(df, ["Meter Name", "Meter", "Meter Code"])
-    commodity = find_col(df, ["Commodity"])
-    use = find_col(df, ["Use", "Usage", "Consumption", "Actual Use"])
-    unit = find_col(df, ["Use Unit", "Usage Unit", "Unit", "UOM"])
-    cost = find_col(df, ["Cost", "Total Cost", "Spend"])
-    month = find_col(df, ["Month", "Billing Period", "Period", "Date"])
-
-    keep = df.head(max_rows).copy()
-    out = pd.DataFrame(index=keep.index)
-    out["source_report"] = pd.Series(report_name, index=keep.index, dtype="object")
-    out["source_row"] = np.arange(2, len(keep) + 2)
-    out["site_name"] = text_series(keep, site)
-    out["account_number"] = text_series(keep, account)
-    out["meter_name"] = text_series(keep, meter)
-    out["commodity"] = text_series(keep, commodity)
-    out["usage"] = numeric_series(keep[use], keep.index) if use else empty_float_series(keep.index)
-    out["unit"] = text_series(keep, unit)
-    out["cost"] = numeric_series(keep[cost], keep.index) if cost else empty_float_series(keep.index)
-    out["month"] = date_series(keep[month], keep.index) if month else pd.Series(pd.NaT, index=keep.index)
-    out["report_row_count"] = len(df)
-    out["note"] = pd.Series(f"First {min(max_rows, len(df)):,} rows sampled from {len(df):,} total rows.", index=keep.index, dtype="object")
-    missing_comm = out["commodity"].fillna("").astype(str).str.strip().eq("")
-    if missing_comm.any():
-        out.loc[missing_comm, "commodity"] = out.loc[missing_comm, "unit"].map(infer_commodity).astype("object").values
-    out = standardize_usage_vectorized(out)
-    return out.reset_index(drop=True)
+def normalize_support_report(df: pd.DataFrame, report_name: str, max_rows: int = 1000) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    sample = df.head(max_rows).copy()
+    normalized, mapping = normalize_usage_report(sample, report_name)
+    normalized["source_total_rows"] = len(df)
+    return normalized, mapping
 
 
-def make_issue(row, rule, category, severity, description, correction_area, suggested_action,
-               impacted_mwh=0.0, impacted_dth=0.0, likely_field=""):
-    return {
-        "rule": rule,
-        "category": category,
+def materiality_from_rows(rows: pd.DataFrame) -> Tuple[float, float, float]:
+    if rows is None or rows.empty or "usage_std" not in rows:
+        return 0.0, 0.0, 0.0
+    mwh = rows.loc[rows["std_unit"].eq("MWh"), "usage_std"].abs().sum(skipna=True)
+    dth = rows.loc[rows["std_unit"].eq("Dth"), "usage_std"].abs().sum(skipna=True)
+    tco2e = rows.get("estimated_tco2e_exposure", pd.Series([0] * len(rows))).abs().sum(skipna=True)
+    return float(mwh), float(dth), float(tco2e)
+
+
+def add_object_issue(issues: list, *, energycap_object_type: str, energycap_record: str, severity: str,
+                     qa_domain: str, issue: str, why_it_matters: str, source_reports: str,
+                     site_name: str = "", account_number: str = "", meter_name: str = "", meter_code: str = "",
+                     commodity: str = "", months_impacted: str = "", impacted_mwh: float = 0.0,
+                     impacted_dth: float = 0.0, estimated_tco2e_exposure: float = 0.0,
+                     recommended_energycap_fix: str = "", evidence: str = ""):
+    issues.append({
+        "energycap_object_type": energycap_object_type,
+        "energycap_record_to_review": energycap_record,
         "severity": severity,
-        "description": description,
-        "source_report": row.get("source_report", ""),
-        "source_row": row.get("source_row", ""),
-        "site_name": row.get("site_name", ""),
-        "site_code": row.get("site_code", ""),
-        "account_number": row.get("account_number", ""),
-        "account_name": row.get("account_name", ""),
-        "meter_name": row.get("meter_name", ""),
-        "meter_code": row.get("meter_code", ""),
-        "commodity": row.get("commodity", ""),
-        "vendor": row.get("vendor", ""),
-        "month": row.get("report_month", "") or (str(row.get("month", "")) if pd.notna(row.get("month", pd.NaT)) else ""),
-        "usage": row.get("usage", np.nan),
-        "unit": row.get("unit", ""),
-        "usage_std": row.get("usage_std", np.nan),
-        "std_unit": row.get("std_unit", ""),
+        "qa_domain": qa_domain,
+        "issue": issue,
+        "why_it_matters_for_emissions_export": why_it_matters,
+        "source_reports": source_reports,
+        "site_name": site_name,
+        "account_number": account_number,
+        "meter_name": meter_name,
+        "meter_code": meter_code,
+        "commodity": commodity,
+        "months_impacted": months_impacted,
         "impacted_mwh": impacted_mwh,
         "impacted_dth": impacted_dth,
-        "likely_energycap_area": correction_area,
-        "likely_field_to_review": likely_field,
-        "suggested_correction_action": suggested_action,
-        "correction_key": row.get("correction_key", ""),
-    }
+        "estimated_tco2e_exposure": estimated_tco2e_exposure,
+        "recommended_energycap_fix": recommended_energycap_fix,
+        "evidence": evidence,
+    })
 
 
-def impact_by_unit(row):
-    std_unit = str(row.get("std_unit", ""))
-    usage_std = row.get("usage_std", np.nan)
-    if pd.isna(usage_std):
-        return 0.0, 0.0
-    if std_unit == "MWh":
-        return float(abs(usage_std)), 0.0
-    if std_unit == "Dth":
-        return 0.0, float(abs(usage_std))
-    return 0.0, 0.0
+def month_span(series: pd.Series) -> str:
+    vals = sorted([v for v in series.dropna().astype(str).unique() if v and v != "NaT"])
+    if not vals:
+        return ""
+    if len(vals) <= 6:
+        return ", ".join(vals)
+    return f"{vals[0]} to {vals[-1]} ({len(vals)} months/records)"
 
 
-def append_masked_issues(issues, df, mask, rule, cat, sev, desc, area, action, field, max_issues):
-    subset = df[mask.fillna(False)].head(max_issues)
-    for _, row in subset.iterrows():
-        mwh, dth = impact_by_unit(row)
-        issues.append(make_issue(row, rule, cat, sev, desc, area, action, mwh, dth, field))
-
-
-def create_record_level_issues(master: pd.DataFrame, usage: pd.DataFrame,
-                               r13_sample: pd.DataFrame, r21_sample: pd.DataFrame, r26_sample: pd.DataFrame,
-                               max_detail_per_rule: int = 2000) -> pd.DataFrame:
+def build_energycap_object_register(master: pd.DataFrame, usage: pd.DataFrame,
+                                    r13: pd.DataFrame, r21: pd.DataFrame, r26: pd.DataFrame,
+                                    recon_tolerance_pct: float = 1.0,
+                                    max_objects_per_rule: int = 3000) -> pd.DataFrame:
     issues = []
 
-    if master is not None and not master.empty:
-        checks = [
-            ("MISSING_SITE_NAME", "Site attribution", "High", "Report-03 row does not have a site/building name.",
-             "Sites and Meters", "Add or correct the site/building assignment for this account/meter row.", "Building Name / Site Name",
-             master["site_name"].fillna("").astype(str).str.strip().eq("")),
-            ("MISSING_COUNTRY", "Emissions metadata", "High", "Site is missing country; emissions factors may not be assignable.",
-             "Sites and Meters", "Populate country on the site/building record.", "Building Country / Country",
-             master["country"].fillna("").astype(str).str.strip().eq("")),
-            ("MISSING_COMMODITY_MASTER", "Commodity setup", "High", "Account/meter row is missing or unknown commodity.",
-             "Accounts or Meters", "Populate or correct the commodity on the account/meter setup.", "Commodity",
-             master["commodity"].fillna("").astype(str).str.strip().eq("") | master["commodity"].astype(str).str.lower().eq("unknown")),
-            ("ACCOUNT_WITHOUT_METER", "Meter structure", "Medium", "Account row does not show a meter name or meter code.",
-             "Meters", "Confirm whether the account should be linked to a meter; add/correct meter relationship if needed.", "Meter Name / Meter Code",
-             master["meter_name"].fillna("").astype(str).str.strip().eq("") & master["meter_code"].fillna("").astype(str).str.strip().eq("")),
-            ("MISSING_ACCOUNT_METER_BEGIN_DATE", "Account lifecycle", "Medium", "Account-meter relationship has no begin date.",
-             "Account-Meter relationship", "Add the account-meter begin/effective date to support historical attribution.", "Account-Meter Begin Date",
-             master["acct_meter_begin"].isna()),
-        ]
+    # Core reference sets from Report-03.
+    master_sites = set(master.loc[master["site_key"].ne(""), "site_key"])
+    master_accounts = set(master.loc[master["account_key"].ne(""), "account_key"])
+    master_account_meter = set(master.loc[(master["account_key"].ne("")) & (master["meter_key"].ne("")), "account_meter_key"])
+    master_full = set(master.loc[master["full_rel_key"].str.replace(" | ", "", regex=False).str.strip().ne(""), "full_rel_key"])
+    master_site_comm = set(master.loc[(master["site_key"].ne("")) & (master["commodity_key"].ne("")), "site_commodity_key"])
 
-        active_closed = (
-            master["account_status"].astype(str).str.lower().str.contains("active", na=False)
-            & master["site_status"].astype(str).str.lower().str.contains("closed|inactive", na=False)
+    # Helper lookup for master records.
+    site_lookup = master.drop_duplicates("site_key").set_index("site_key")["site_record"].to_dict()
+    account_lookup = master.drop_duplicates("account_key").set_index("account_key")["account_record"].to_dict()
+    meter_lookup = master.drop_duplicates("account_meter_key").set_index("account_meter_key")["account_meter_record"].to_dict()
+
+    # 1. Usage site not in master.
+    mask = usage["site_key"].ne("") & ~usage["site_key"].isin(master_sites)
+    grouped = usage[mask].groupby(["site_key", "site_name"], dropna=False)
+    for (site_key, site_name), rows in list(grouped)[:max_objects_per_rule]:
+        mwh, dth, tco2e = materiality_from_rows(rows)
+        add_object_issue(
+            issues,
+            energycap_object_type="Site",
+            energycap_record=site_name or site_key,
+            severity="High",
+            qa_domain="Hierarchy reconciliation",
+            issue="Usage exists for a site that is not present in the Report-03 EnergyCAP master hierarchy.",
+            why_it_matters="Usage may be excluded from site-level emissions, mapped to an unintended site, or fail downstream site matching.",
+            source_reports="Report-19 vs Report-03",
+            site_name=site_name,
+            months_impacted=month_span(rows["report_month"]),
+            impacted_mwh=mwh,
+            impacted_dth=dth,
+            estimated_tco2e_exposure=tco2e,
+            recommended_energycap_fix="Review the EnergyCAP site/building record and Report-03 export scope. Correct site naming, topmost filters, or site assignment.",
+            evidence=f"site_key={site_key}; usage_rows={len(rows)}",
         )
-        checks.append(("ACTIVE_ACCOUNT_ON_CLOSED_SITE", "Account lifecycle", "High",
-                       "Account appears active while the associated site is closed/inactive.",
-                       "Accounts / Sites and Meters",
-                       "Confirm whether the account should be closed, moved to an active site, or whether the site status is wrong.",
-                       "Account Status / Site Open-Closed", active_closed))
 
-        for args in checks:
-            append_masked_issues(issues, master, args[-1], *args[:-1], max_detail_per_rule)
+    # 2. Usage account not in master.
+    mask = usage["account_key"].ne("") & ~usage["account_key"].isin(master_accounts)
+    grouped = usage[mask].groupby(["account_key", "account_number"], dropna=False)
+    for (account_key, account_number), rows in list(grouped)[:max_objects_per_rule]:
+        mwh, dth, tco2e = materiality_from_rows(rows)
+        add_object_issue(
+            issues,
+            energycap_object_type="Account",
+            energycap_record=account_number or account_key,
+            severity="High",
+            qa_domain="Hierarchy reconciliation",
+            issue="Usage exists for an account that is not present in Report-03 master setup.",
+            why_it_matters="The emissions export may include consumption that cannot be tied back to a governed account/site/meter structure.",
+            source_reports="Report-19 vs Report-03",
+            site_name=", ".join(rows["site_name"].dropna().astype(str).unique()[:3]),
+            account_number=account_number,
+            commodity=", ".join(rows["commodity"].dropna().astype(str).unique()[:3]),
+            months_impacted=month_span(rows["report_month"]),
+            impacted_mwh=mwh,
+            impacted_dth=dth,
+            estimated_tco2e_exposure=tco2e,
+            recommended_energycap_fix="Confirm the account exists, is in scope, and is linked to the correct site/meter in EnergyCAP. Also confirm Report-03 and Report-19 used the same topmost/date/filter scope.",
+            evidence=f"account_key={account_key}; usage_rows={len(rows)}",
+        )
 
-        dup_subset = [c for c in ["site_name", "account_number", "meter_code", "commodity"] if c in master.columns]
-        if dup_subset:
-            dup_mask = master.duplicated(subset=dup_subset, keep=False)
-            append_masked_issues(
-                issues, master, dup_mask, "DUPLICATE_MASTER_RELATIONSHIP", "Meter structure", "Medium",
-                "Duplicate site/account/meter/commodity relationship appears in Report-03.",
-                "Accounts / Meters",
-                "Review duplicate account-meter-site relationship rows and remove or correct duplicate setup if inappropriate.",
-                "Site / Account / Meter relationship", max_detail_per_rule
+    # 3. Account-meter relationship missing in master.
+    mask = usage["account_key"].ne("") & usage["meter_key"].ne("") & ~usage["account_meter_key"].isin(master_account_meter)
+    grouped = usage[mask].groupby(["account_meter_key", "account_number", "meter_name", "meter_code"], dropna=False)
+    for (am_key, acct, meter_name, meter_code), rows in list(grouped)[:max_objects_per_rule]:
+        mwh, dth, tco2e = materiality_from_rows(rows)
+        add_object_issue(
+            issues,
+            energycap_object_type="Account-Meter relationship",
+            energycap_record=f"{acct} → {meter_code or meter_name}",
+            severity="High",
+            qa_domain="Hierarchy reconciliation",
+            issue="Report-19 usage is tied to an account-meter relationship that is not present in Report-03.",
+            why_it_matters="Usage may be attached to the wrong meter, missing effective dates, or misattributed in site-level emissions.",
+            source_reports="Report-19 vs Report-03",
+            site_name=", ".join(rows["site_name"].dropna().astype(str).unique()[:3]),
+            account_number=acct,
+            meter_name=meter_name,
+            meter_code=meter_code,
+            commodity=", ".join(rows["commodity"].dropna().astype(str).unique()[:3]),
+            months_impacted=month_span(rows["report_month"]),
+            impacted_mwh=mwh,
+            impacted_dth=dth,
+            estimated_tco2e_exposure=tco2e,
+            recommended_energycap_fix="Review account-meter relationship, meter code/name, and effective dates in EnergyCAP.",
+            evidence=f"account_meter_key={am_key}; usage_rows={len(rows)}",
+        )
+
+    # 4. Full hierarchy mismatch: site/account/meter/commodity.
+    mask = usage["full_rel_key"].str.replace(" | ", "", regex=False).str.strip().ne("") & ~usage["full_rel_key"].isin(master_full)
+    grouped = usage[mask].groupby(["full_rel_key", "site_name", "account_number", "meter_name", "meter_code", "commodity"], dropna=False)
+    for (full_key, site, acct, meter_name, meter_code, commodity), rows in list(grouped)[:max_objects_per_rule]:
+        mwh, dth, tco2e = materiality_from_rows(rows)
+        add_object_issue(
+            issues,
+            energycap_object_type="Site-Account-Meter-Commodity relationship",
+            energycap_record=f"{site} → {acct} → {meter_code or meter_name} → {commodity}",
+            severity="Medium",
+            qa_domain="Hierarchy reconciliation",
+            issue="The full usage relationship does not match the Report-03 master relationship.",
+            why_it_matters="Even if the account/meter exists, commodity or site mapping may be inconsistent, affecting site-level emissions attribution.",
+            source_reports="Report-19 vs Report-03",
+            site_name=site,
+            account_number=acct,
+            meter_name=meter_name,
+            meter_code=meter_code,
+            commodity=commodity,
+            months_impacted=month_span(rows["report_month"]),
+            impacted_mwh=mwh,
+            impacted_dth=dth,
+            estimated_tco2e_exposure=tco2e,
+            recommended_energycap_fix="Review the site, account, meter, and commodity combination in EnergyCAP. Confirm commodity assignment and site rollup.",
+            evidence=f"full_rel_key={full_key}; usage_rows={len(rows)}",
+        )
+
+    # 5. Site-commodity not configured in master.
+    mask = usage["site_commodity_key"].str.replace(" | ", "", regex=False).str.strip().ne("") & ~usage["site_commodity_key"].isin(master_site_comm)
+    grouped = usage[mask].groupby(["site_commodity_key", "site_name", "commodity"], dropna=False)
+    for (sc_key, site, commodity), rows in list(grouped)[:max_objects_per_rule]:
+        mwh, dth, tco2e = materiality_from_rows(rows)
+        add_object_issue(
+            issues,
+            energycap_object_type="Site-Commodity relationship",
+            energycap_record=f"{site} → {commodity}",
+            severity="Medium",
+            qa_domain="Commodity reconciliation",
+            issue="Usage exists for a site/commodity combination not configured in the master hierarchy.",
+            why_it_matters="The emissions tool may not know how to classify or factor the commodity for that site.",
+            source_reports="Report-19 vs Report-03",
+            site_name=site,
+            commodity=commodity,
+            months_impacted=month_span(rows["report_month"]),
+            impacted_mwh=mwh,
+            impacted_dth=dth,
+            estimated_tco2e_exposure=tco2e,
+            recommended_energycap_fix="Check commodity assigned to account/meter and whether the site should have this commodity in scope.",
+            evidence=f"site_commodity_key={sc_key}; usage_rows={len(rows)}",
+        )
+
+    # 6. Active master accounts with no usage.
+    active_mask = ~master["account_status"].str.lower().str.contains("inactive|closed", na=False)
+    candidates = master[active_mask & master["account_key"].ne("")]
+    usage_accounts = set(usage.loc[usage["account_key"].ne(""), "account_key"])
+    missing_usage = candidates[~candidates["account_key"].isin(usage_accounts)]
+    grouped = missing_usage.groupby(["account_key", "account_record"], dropna=False)
+    for (account_key, account_record), rows in list(grouped)[:max_objects_per_rule]:
+        r = rows.iloc[0]
+        add_object_issue(
+            issues,
+            energycap_object_type="Account",
+            energycap_record=account_record or account_key,
+            severity="Medium",
+            qa_domain="Usage completeness",
+            issue="Active account in Report-03 has no corresponding usage in Report-19.",
+            why_it_matters="An active account without usage may indicate missing bills or export filters excluding consumption from emissions.",
+            source_reports="Report-03 vs Report-19",
+            site_name=r.get("site_name", ""),
+            account_number=r.get("account_number", ""),
+            meter_name=r.get("meter_name", ""),
+            meter_code=r.get("meter_code", ""),
+            commodity=r.get("commodity", ""),
+            recommended_energycap_fix="Check missing bills, account close status, report date range, and Report-19 filters.",
+            evidence=f"account_key={account_key}; master_rows={len(rows)}",
+        )
+
+    # 7. Missing geography for sites that actually have energy usage.
+    usage_site_keys = set(usage.loc[usage["site_key"].ne(""), "site_key"])
+    used_sites = master[master["site_key"].isin(usage_site_keys)]
+    missing_geo = used_sites[(used_sites["country"].str.strip().eq("")) | (used_sites["site_name"].str.strip().eq(""))]
+    grouped = missing_geo.groupby(["site_key", "site_record"], dropna=False)
+    for (site_key, site_record), rows in list(grouped)[:max_objects_per_rule]:
+        related_usage = usage[usage["site_key"].eq(site_key)]
+        mwh, dth, tco2e = materiality_from_rows(related_usage)
+        r = rows.iloc[0]
+        add_object_issue(
+            issues,
+            energycap_object_type="Site",
+            energycap_record=site_record or site_key,
+            severity="High",
+            qa_domain="Emissions readiness",
+            issue="Site with energy usage is missing required geography/name metadata.",
+            why_it_matters="Location-based emissions factors require geography; missing site identity/geography can prevent correct emissions calculation.",
+            source_reports="Report-03 + Report-19",
+            site_name=r.get("site_name", ""),
+            commodity=", ".join(related_usage["commodity"].dropna().astype(str).unique()[:3]),
+            months_impacted=month_span(related_usage["report_month"]),
+            impacted_mwh=mwh,
+            impacted_dth=dth,
+            estimated_tco2e_exposure=tco2e,
+            recommended_energycap_fix="Populate site/building name and country/state/province in EnergyCAP.",
+            evidence=f"site_key={site_key}; country='{r.get('country','')}'",
+        )
+
+    # 8. Unconvertible usage units or commodity for emissions export.
+    mask = usage["usage"].notna() & (usage["usage_std"].isna() | usage["std_unit"].str.strip().eq(""))
+    grouped = usage[mask].groupby(["account_key", "meter_key", "commodity", "unit"], dropna=False)
+    for (acct_key, meter_key, commodity, unit), rows in list(grouped)[:max_objects_per_rule]:
+        add_object_issue(
+            issues,
+            energycap_object_type="Bill / Usage record",
+            energycap_record=f"Account {rows.iloc[0].get('account_number','')} | Meter {rows.iloc[0].get('meter_code') or rows.iloc[0].get('meter_name','')} | {commodity} | unit {unit}",
+            severity="High",
+            qa_domain="Emissions readiness",
+            issue="Usage exists but cannot be converted to harmonized emissions units.",
+            why_it_matters="The downstream emissions tool needs harmonized MWh for electricity and Dth for natural gas.",
+            source_reports="Report-19",
+            site_name=", ".join(rows["site_name"].dropna().astype(str).unique()[:3]),
+            account_number=rows.iloc[0].get("account_number", ""),
+            meter_name=rows.iloc[0].get("meter_name", ""),
+            meter_code=rows.iloc[0].get("meter_code", ""),
+            commodity=commodity,
+            months_impacted=month_span(rows["report_month"]),
+            recommended_energycap_fix="Correct the commodity and usage unit on the meter/bill setup or add the required unit conversion logic.",
+            evidence=f"unit={unit}; commodity={commodity}; usage_rows={len(rows)}",
+        )
+
+    # 9. Missing monthly coverage at site/commodity level.
+    u_month = usage[usage["report_month"].ne("") & usage["site_key"].ne("") & usage["commodity_key"].ne("")]
+    if not u_month.empty:
+        all_months = sorted(u_month["report_month"].unique())
+        expected_n = len(all_months)
+        if expected_n > 1:
+            coverage = u_month.groupby(["site_key", "site_name", "commodity_key", "commodity"], dropna=False).agg(
+                months_present=("report_month", "nunique"),
+                impacted_mwh=("usage_std", lambda s: s[u_month.loc[s.index, "std_unit"].eq("MWh")].abs().sum()),
+                impacted_dth=("usage_std", lambda s: s[u_month.loc[s.index, "std_unit"].eq("Dth")].abs().sum()),
+                tco2e=("estimated_tco2e_exposure", lambda s: s.abs().sum()),
+            ).reset_index()
+            incomplete = coverage[coverage["months_present"] < expected_n]
+            for _, r in incomplete.head(max_objects_per_rule).iterrows():
+                add_object_issue(
+                    issues,
+                    energycap_object_type="Site-Commodity monthly coverage",
+                    energycap_record=f"{r['site_name']} → {r['commodity']}",
+                    severity="Medium",
+                    qa_domain="Usage completeness",
+                    issue=f"Site/commodity has {int(r['months_present'])} of {expected_n} months in Report-19.",
+                    why_it_matters="Missing months may understate annual site-level emissions.",
+                    source_reports="Report-19",
+                    site_name=r["site_name"],
+                    commodity=r["commodity"],
+                    months_impacted=f"{int(r['months_present'])}/{expected_n} months present",
+                    impacted_mwh=float(r["impacted_mwh"]),
+                    impacted_dth=float(r["impacted_dth"]),
+                    estimated_tco2e_exposure=float(r["tco2e"]),
+                    recommended_energycap_fix="Check missing bills, late invoices, account open/close status, and report date filters.",
+                    evidence=f"Expected months in extract={expected_n}; present={int(r['months_present'])}",
+                )
+
+    # 10. Duplicate bill / usage facts.
+    dup_cols = ["site_key", "account_key", "meter_key", "commodity_key", "report_month", "usage", "unit"]
+    dup = usage.duplicated(subset=dup_cols, keep=False)
+    grouped = usage[dup].groupby(dup_cols, dropna=False)
+    for key, rows in list(grouped)[:max_objects_per_rule]:
+        mwh, dth, tco2e = materiality_from_rows(rows)
+        r = rows.iloc[0]
+        add_object_issue(
+            issues,
+            energycap_object_type="Bill / Usage record",
+            energycap_record=f"Account {r.get('account_number','')} | Meter {r.get('meter_code') or r.get('meter_name','')} | {r.get('commodity','')} | {r.get('report_month','')}",
+            severity="High",
+            qa_domain="Usage completeness",
+            issue="Potential duplicate usage fact at the same site/account/meter/commodity/month/usage/unit grain.",
+            why_it_matters="Duplicate usage will overstate site-level emissions.",
+            source_reports="Report-19",
+            site_name=r.get("site_name", ""),
+            account_number=r.get("account_number", ""),
+            meter_name=r.get("meter_name", ""),
+            meter_code=r.get("meter_code", ""),
+            commodity=r.get("commodity", ""),
+            months_impacted=r.get("report_month", ""),
+            impacted_mwh=mwh,
+            impacted_dth=dth,
+            estimated_tco2e_exposure=tco2e,
+            recommended_energycap_fix="Review bill history and import batches for duplicate or corrected invoices.",
+            evidence=f"duplicate_count={len(rows)}",
+        )
+
+    # 11. Report-26 aggregate mismatch vs Report-19.
+    if r26 is not None and not r26.empty and "usage_std" in r26:
+        r19_agg = usage.dropna(subset=["usage_std"]).groupby(["site_key", "site_name", "commodity_key", "commodity", "std_unit"], dropna=False)["usage_std"].sum().reset_index(name="report19_usage_std")
+        r26_agg = r26.dropna(subset=["usage_std"]).groupby(["site_key", "commodity_key", "std_unit"], dropna=False)["usage_std"].sum().reset_index(name="report26_usage_std")
+        cmp = r19_agg.merge(r26_agg, on=["site_key", "commodity_key", "std_unit"], how="outer")
+        cmp["report19_usage_std"] = cmp["report19_usage_std"].fillna(0)
+        cmp["report26_usage_std"] = cmp["report26_usage_std"].fillna(0)
+        cmp["site_name"] = cmp["site_name"].fillna(cmp["site_key"])
+        cmp["commodity"] = cmp["commodity"].fillna(cmp["commodity_key"])
+        cmp["diff"] = cmp["report19_usage_std"] - cmp["report26_usage_std"]
+        cmp["denom"] = cmp[["report19_usage_std", "report26_usage_std"]].abs().max(axis=1).replace(0, np.nan)
+        cmp["diff_pct"] = (cmp["diff"].abs() / cmp["denom"]) * 100
+        bad = cmp[cmp["diff_pct"].fillna(0) > recon_tolerance_pct]
+        for _, r in bad.head(max_objects_per_rule).iterrows():
+            unit = r["std_unit"]
+            mwh = abs(r["diff"]) if unit == "MWh" else 0.0
+            dth = abs(r["diff"]) if unit == "Dth" else 0.0
+            tco2e = mwh * DEFAULT_ELECTRICITY_TCO2E_PER_MWH + dth * DEFAULT_GAS_TCO2E_PER_DTH
+            add_object_issue(
+                issues,
+                energycap_object_type="Aggregate rollup / report filter",
+                energycap_record=f"{r['site_name']} → {r['commodity']} → {unit}",
+                severity="High",
+                qa_domain="Rollup reconciliation",
+                issue="Report-26 aggregate usage does not reconcile to Report-19 usage at site/commodity/unit level.",
+                why_it_matters="The emissions export may not align with EnergyCAP rollups, indicating filter, chargeback, data type, or aggregation issues.",
+                source_reports="Report-26 vs Report-19",
+                site_name=r["site_name"],
+                commodity=r["commodity"],
+                unit=unit,
+                impacted_mwh=float(mwh),
+                impacted_dth=float(dth),
+                estimated_tco2e_exposure=float(tco2e),
+                recommended_energycap_fix="Confirm Report-19 and Report-26 were run with identical data type, date range, bill-source, void-bill, commodity, and topmost filters. Review chargebacks and aggregation settings.",
+                evidence=f"Report19={r['report19_usage_std']}; Report26={r['report26_usage_std']}; diff={r['diff']}; diff_pct={r['diff_pct']:.2f}%",
             )
 
-    if usage is not None and not usage.empty:
-        usage_checks = [
-            ("USAGE_WITHOUT_SITE", "Site attribution", "High", "Usage row does not have a site name.",
-             "Bill / Account / Site assignment", "Correct the account or meter site assignment so usage rolls to the correct site.", "Site Name",
-             usage["site_name"].fillna("").astype(str).str.strip().eq("")),
-            ("MISSING_USAGE_VALUE", "Billing integrity", "High", "Usage row has no numeric usage value.",
-             "Bill Entry", "Review the bill record and enter/correct the usage value.", "Use / Usage",
-             usage["usage"].isna()),
-            ("UNSTANDARDIZED_USAGE_UNIT", "Unit harmonization", "High", "Usage unit could not be converted to MWh or Dth.",
-             "Bill Entry / Meter Setup", "Correct the usage unit or commodity so the record can be standardized.", "Use Unit / Commodity",
-             usage["usage"].notna() & usage["usage_std"].isna()),
-            ("MISSING_COMMODITY_USAGE", "Commodity setup", "High", "Usage row has missing or unknown commodity.",
-             "Bill Entry / Account Setup", "Correct the commodity associated with the bill/account/meter.", "Commodity",
-             usage["commodity"].fillna("").astype(str).str.strip().eq("") | usage["commodity"].astype(str).str.lower().eq("unknown")),
-        ]
-        for args in usage_checks:
-            append_masked_issues(issues, usage, args[-1], *args[:-1], max_detail_per_rule)
-
-        dup_subset = [c for c in ["site_name", "account_number", "meter_name", "commodity", "month", "usage", "cost"] if c in usage.columns]
-        if dup_subset:
-            dup_mask = usage.duplicated(subset=dup_subset, keep=False)
-            append_masked_issues(
-                issues, usage, dup_mask, "POTENTIAL_DUPLICATE_USAGE_ROW", "Duplicate bills", "High",
-                "Potential duplicate usage row based on matching site/account/meter/commodity/month/usage/cost.",
-                "Bills / Batch Import",
-                "Review whether this bill was imported twice, manually entered in addition to a feed, or reissued as a corrected invoice.",
-                "Invoice / Billing Period / Usage", max_detail_per_rule
+    # 12. Report-13 bill analysis support, grouped by bill/usage object where possible.
+    if r13 is not None and not r13.empty:
+        grouped = r13.groupby(["account_key", "meter_key", "commodity_key"], dropna=False)
+        for (acct_key, meter_key, comm_key), rows in list(grouped)[:max_objects_per_rule]:
+            r = rows.iloc[0]
+            mwh, dth, tco2e = materiality_from_rows(rows)
+            add_object_issue(
+                issues,
+                energycap_object_type="Bill / Usage record",
+                energycap_record=f"Account {r.get('account_number','')} | Meter {r.get('meter_code') or r.get('meter_name','')} | {r.get('commodity','')}",
+                severity="Medium",
+                qa_domain="Bill anomaly",
+                issue="Bill/account/meter appears in Report-13 Bill Analysis and should be reviewed.",
+                why_it_matters="Outlier bills can materially distort emissions if usage, dates, demand, or units are wrong.",
+                source_reports="Report-13",
+                site_name=", ".join(rows["site_name"].dropna().astype(str).unique()[:3]),
+                account_number=r.get("account_number", ""),
+                meter_name=r.get("meter_name", ""),
+                meter_code=r.get("meter_code", ""),
+                commodity=r.get("commodity", ""),
+                months_impacted=month_span(rows.get("report_month", pd.Series(dtype=str))),
+                impacted_mwh=mwh,
+                impacted_dth=dth,
+                estimated_tco2e_exposure=tco2e,
+                recommended_energycap_fix="Open the affected bill/account/meter in EnergyCAP and validate usage, cost, demand, service dates, and units.",
+                evidence=f"Report-13 sampled rows={len(rows)}",
             )
 
-        if master is not None and not master.empty:
-            master_sites = set(master["site_name"].dropna().astype(str).str.strip())
-            unknown_site_mask = ~usage["site_name"].fillna("").astype(str).str.strip().isin(master_sites)
-            unknown_site_mask = unknown_site_mask & usage["site_name"].fillna("").astype(str).str.strip().ne("")
-            append_masked_issues(
-                issues, usage, unknown_site_mask, "USAGE_SITE_NOT_IN_REPORT03_MASTER", "Site attribution", "High",
-                "Usage site in Report-19 was not found in Report-03 master setup.",
-                "Sites and Meters / Account Mapping",
-                "Check for site naming mismatch, inactive/missing site, or account mapped to an unexpected site.",
-                "Site Name / Building Name", max_detail_per_rule
+    # 13. Report-21 variance support, grouped by site/commodity object.
+    if r21 is not None and not r21.empty:
+        grouped = r21.groupby(["site_key", "commodity_key"], dropna=False)
+        for (site_key, comm_key), rows in list(grouped)[:max_objects_per_rule]:
+            r = rows.iloc[0]
+            mwh, dth, tco2e = materiality_from_rows(rows)
+            add_object_issue(
+                issues,
+                energycap_object_type="Site-Commodity variance",
+                energycap_record=f"{r.get('site_name','')} → {r.get('commodity','')}",
+                severity="Low",
+                qa_domain="Variance review",
+                issue="Site/commodity appears in Report-21 Monthly Comparison review sample.",
+                why_it_matters="Large year-over-year variances can indicate missing bills, account moves, meter changes, or true operational changes that should be explained before emissions export.",
+                source_reports="Report-21",
+                site_name=r.get("site_name", ""),
+                commodity=r.get("commodity", ""),
+                months_impacted=month_span(rows.get("report_month", pd.Series(dtype=str))),
+                impacted_mwh=mwh,
+                impacted_dth=dth,
+                estimated_tco2e_exposure=tco2e,
+                recommended_energycap_fix="Review the site/commodity in EnergyCAP Monthly Comparison and document whether the variance is explained or requires correction.",
+                evidence=f"Report-21 sampled rows={len(rows)}",
             )
-
-        temp = usage.dropna(subset=["month"]).copy()
-        if not temp.empty:
-            temp["period"] = temp["month"].dt.to_period("M")
-            coverage = temp.groupby(["site_name", "commodity"], dropna=False)["period"].nunique().reset_index(name="months_present")
-            incomplete = coverage[coverage["months_present"] < 12].head(max_detail_per_rule)
-            for _, r in incomplete.iterrows():
-                row = {
-                    "source_report": "Report-19", "source_row": "",
-                    "site_name": r.get("site_name", ""), "commodity": r.get("commodity", ""),
-                    "report_month": "", "correction_key": f"{r.get('site_name','')} |  | ",
-                }
-                issues.append(make_issue(
-                    row, "INCOMPLETE_12_MONTH_COVERAGE", "Completeness", "Medium",
-                    f"Site/commodity has only {int(r['months_present'])} month(s) present in the Report-19 extract.",
-                    "Bills / Missing Bills",
-                    "Check for missing bills, late bills, closed accounts, or incorrect report date filters.",
-                    0.0, 0.0, "Billing Period / Missing Bills"
-                ))
-
-    for sample, rule, cat, sev, desc, area, action in [
-        (r13_sample, "REPORT13_REVIEW_RECORD", "Billing integrity", "Medium",
-         "Sampled row from Report-13 Bill Analysis for outlier/bill review.",
-         "Bill Analysis / Bill Entry", "Validate use, cost, demand, dates, and units in the referenced bill/account/meter."),
-        (r21_sample, "REPORT21_REVIEW_RECORD", "Variance", "Medium",
-         "Sampled row from Report-21 Monthly Comparison for abnormal variance review.",
-         "Monthly Comparison / Bill History", "Review current vs. base year variance and confirm whether setup, missing bills, or operations explain it."),
-        (r26_sample, "REPORT26_RECON_SAMPLE", "Reconciliation", "Low",
-         "Sampled row from Report-26 for reconciliation support.",
-         "Use and Cost Summary", "Use this row to reconcile site/account/commodity totals."),
-    ]:
-        if sample is not None and not sample.empty:
-            for _, row in sample.iterrows():
-                mwh, dth = impact_by_unit(row)
-                issues.append(make_issue(row, rule, cat, sev, desc, area, action, mwh, dth, "Report output row"))
 
     out = pd.DataFrame(issues)
     if out.empty:
         return out
-    out.insert(0, "issue_number", range(1, len(out) + 1))
-    out["issue_id"] = out.apply(lambda r: f"{r['rule']}-{int(r['issue_number']):06d}", axis=1)
-    preferred = [
-        "issue_id", "severity", "category", "rule", "description",
-        "source_report", "source_row", "site_name", "site_code", "account_number", "account_name",
-        "meter_name", "meter_code", "commodity", "vendor", "month", "usage", "unit", "usage_std",
-        "std_unit", "impacted_mwh", "impacted_dth",
-        "likely_energycap_area", "likely_field_to_review", "suggested_correction_action", "correction_key"
-    ]
-    return out[[c for c in preferred if c in out.columns]]
+    out.insert(0, "register_id", [f"ECAP-QA-{i:06d}" for i in range(1, len(out) + 1)])
+    out = out.sort_values(
+        by=["severity", "estimated_tco2e_exposure", "impacted_mwh", "impacted_dth"],
+        ascending=[True, False, False, False],
+        key=lambda col: col.map({"High": 0, "Medium": 1, "Low": 2}) if col.name == "severity" else col
+    ).reset_index(drop=True)
+    return out
 
 
-def summarize_issues(issue_detail: pd.DataFrame) -> pd.DataFrame:
-    if issue_detail is None or issue_detail.empty:
-        return pd.DataFrame(columns=["category", "severity", "rule", "occurrences", "impacted_mwh", "impacted_dth"])
+def summarize_register(register: pd.DataFrame) -> pd.DataFrame:
+    if register is None or register.empty:
+        return pd.DataFrame(columns=["energycap_object_type", "severity", "qa_domain", "records", "impacted_mwh", "impacted_dth", "estimated_tco2e_exposure"])
     return (
-        issue_detail.groupby(["category", "severity", "rule"], dropna=False)
-        .agg(occurrences=("issue_id", "count"), impacted_mwh=("impacted_mwh", "sum"), impacted_dth=("impacted_dth", "sum"))
+        register.groupby(["energycap_object_type", "severity", "qa_domain"], dropna=False)
+        .agg(
+            records=("register_id", "count"),
+            impacted_mwh=("impacted_mwh", "sum"),
+            impacted_dth=("impacted_dth", "sum"),
+            estimated_tco2e_exposure=("estimated_tco2e_exposure", "sum"),
+        )
         .reset_index()
-        .sort_values(["severity", "occurrences"], ascending=[True, False])
+        .sort_values(["severity", "estimated_tco2e_exposure", "records"], ascending=[True, False, False],
+                     key=lambda col: col.map({"High": 0, "Medium": 1, "Low": 2}) if col.name == "severity" else col)
     )
 
 
-def score_qa(issue_detail: pd.DataFrame) -> int:
-    if issue_detail is None or issue_detail.empty:
+def site_readiness(master: pd.DataFrame, usage: pd.DataFrame, register: pd.DataFrame) -> pd.DataFrame:
+    usage_agg = (
+        usage.dropna(subset=["usage_std"])
+        .groupby(["site_key", "site_name"], dropna=False)
+        .agg(
+            total_mwh=("usage_std", lambda s: s[usage.loc[s.index, "std_unit"].eq("MWh")].sum()),
+            total_dth=("usage_std", lambda s: s[usage.loc[s.index, "std_unit"].eq("Dth")].sum()),
+            estimated_tco2e=("estimated_tco2e_exposure", "sum"),
+            commodities=("commodity", lambda s: ", ".join(sorted(set([x for x in s.astype(str) if x])))),
+            months=("report_month", lambda s: len(set([x for x in s.astype(str) if x and x != "NaT"]))),
+        )
+        .reset_index()
+    )
+    if register is None or register.empty:
+        usage_agg["open_qa_items"] = 0
+        usage_agg["high_severity_items"] = 0
+        usage_agg["readiness"] = "Ready"
+        return usage_agg
+
+    reg = register.groupby("site_name", dropna=False).agg(
+        open_qa_items=("register_id", "count"),
+        high_severity_items=("severity", lambda s: (s == "High").sum()),
+        impacted_tco2e=("estimated_tco2e_exposure", "sum"),
+    ).reset_index()
+
+    out = usage_agg.merge(reg, on="site_name", how="left")
+    out[["open_qa_items", "high_severity_items", "impacted_tco2e"]] = out[["open_qa_items", "high_severity_items", "impacted_tco2e"]].fillna(0)
+    out["readiness"] = np.where(out["high_severity_items"] > 0, "Not ready",
+                        np.where(out["open_qa_items"] > 0, "Conditional", "Ready"))
+    return out.sort_values(["readiness", "impacted_tco2e"], ascending=[False, False])
+
+
+def readiness_score(register: pd.DataFrame, usage: pd.DataFrame) -> int:
+    if register is None or register.empty:
         return 100
-    weights = {"High": 5, "Medium": 2, "Low": 0.5}
-    grouped = issue_detail.groupby("severity").size().to_dict()
-    penalty = sum(np.log1p(count) * weights.get(sev, 1) * 4 for sev, count in grouped.items())
-    return int(max(0, round(100 - penalty)))
+    total_tco2e = usage.get("estimated_tco2e_exposure", pd.Series([0])).abs().sum()
+    impacted_tco2e = register.loc[register["severity"].isin(["High", "Medium"]), "estimated_tco2e_exposure"].abs().sum()
+    materiality_penalty = 0 if total_tco2e == 0 else min(45, (impacted_tco2e / total_tco2e) * 100)
+    counts = register.groupby("severity").size().to_dict()
+    count_penalty = (
+        np.log1p(counts.get("High", 0)) * 9
+        + np.log1p(counts.get("Medium", 0)) * 4
+        + np.log1p(counts.get("Low", 0)) * 1
+    )
+    return int(max(0, round(100 - materiality_penalty - count_penalty)))
