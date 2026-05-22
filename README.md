@@ -1,14 +1,15 @@
-# EnergyCAP Pre-Export QA App — v2
+# EnergyCAP Pre-Export QA App — v3 Fast
 
-Streamlit app to ingest EnergyCAP Reports 03, 19, 13, 21, and 26 and produce a record-level correction workbench before exporting energy utility usage to an emissions calculation tool.
+This version fixes the v2 performance issue and the `raw_record_preview` crash.
 
-## What changed in v2
+## Main fixes
 
-- The app does not analyze automatically.
-- All five files must be uploaded before the `Run QA` button is enabled.
-- The app produces detailed record-level exceptions, not only summary counts.
-- Each issue includes a correction target: Site, Account, Meter, Commodity, Month, likely EnergyCAP area to review, and suggested correction action.
-- Exception downloads are available as CSV.
+- Removed slow row-by-row raw-record aggregation.
+- Avoids turning every row of Reports 13/21/26 into a correction-register item.
+- Adds configurable caps for review records.
+- Keeps detailed record-level exceptions for actionable setup and usage issues from Reports 03 and 19.
+- Keeps Reports 13, 21, and 26 as supporting review inputs.
+- The app waits until all 5 reports are uploaded and the user clicks **Run QA**.
 
 ## Run locally
 
@@ -16,11 +17,3 @@ Streamlit app to ingest EnergyCAP Reports 03, 19, 13, 21, and 26 and produce a r
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-## Deploy on Streamlit Community Cloud
-
-Upload these files to GitHub and set `app.py` as the main file.
-
-## Important note
-
-EnergyCAP report exports vary by tenant and configuration. The parser uses flexible column detection, but column mappings should be validated with your actual export formats before production use.
